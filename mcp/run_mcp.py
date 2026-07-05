@@ -5,8 +5,17 @@ import sys
 from pathlib import Path
 
 
-def _setup_logging(script_dir: Path) -> None:
-    runtime_log = script_dir / "feed_mcp.runtime.log"
+def _runtime_dir(script_dir: Path) -> Path:
+    raw = os.environ.get("AKA_PLUGIN_DATA_DIR", "").strip()
+    if not raw:
+        return script_dir
+    path = Path(raw).expanduser()
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _setup_logging(runtime_dir: Path) -> None:
+    runtime_log = runtime_dir / "feed_mcp.runtime.log"
     runtime_log.parent.mkdir(parents=True, exist_ok=True)
 
     formatter = logging.Formatter(
@@ -35,7 +44,7 @@ def main() -> None:
         sys.path.insert(0, str(script_dir))
 
     # 2. 初始化日志（落盘 + stderr）。
-    _setup_logging(script_dir)
+    _setup_logging(_runtime_dir(script_dir))
 
     # 3. 启动 MCP stdio 服务。
     from src.mcp_bridge import create_mcp_server

@@ -61,6 +61,15 @@ class FeedMcpConfig:
 def _config_path() -> Path:
     return Path(__file__).resolve().parent.parent / "feed_mcp.json"
 
+
+def _runtime_root() -> Path:
+    raw = os.environ.get("AKA_PLUGIN_DATA_DIR", "").strip()
+    if not raw:
+        return _config_path().parent
+    path = Path(raw).expanduser()
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
 def load_config() -> FeedMcpConfig:
     raw = dict(_DEFAULT_CONFIG)
     path = _config_path()
@@ -68,7 +77,7 @@ def load_config() -> FeedMcpConfig:
         raw.update(json.loads(path.read_text()))
     db_path = Path(str(raw["db_path"]))
     if not db_path.is_absolute():
-        db_path = (path.parent / db_path).resolve()
+        db_path = (_runtime_root() / db_path).resolve()
     return FeedMcpConfig(
         db_path=db_path,
         poll_ttl_seconds=max(60, int(raw["poll_ttl_seconds"])),
