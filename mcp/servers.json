@@ -1,0 +1,12 @@
+{
+  "servers": {
+    "feed": {
+      "command": [
+        "python",
+        "mcp/run_mcp.py"
+      ],
+      "env": {},
+      "cwd": "."
+    }
+  }
+}

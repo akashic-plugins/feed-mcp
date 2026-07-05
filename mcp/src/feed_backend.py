@@ -1,0 +1,1381 @@
+"""
+feed-mcp backend
+
+最小实现：
+1. 用 sqlite 管理订阅源和条目
+2. 按需轮询 RSS/Atom
+3. 对外提供 proactive content 事件与基础管理查询能力
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import logging
+import re
+import sqlite3
+import subprocess
+import time
+import uuid
+import xml.etree.ElementTree as ET
+import os
+from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
+from email.utils import parsedate_to_datetime
+from pathlib import Path
+from typing import Any
+from urllib.parse import unquote, urlparse
+
+import requests
+
+logger = logging.getLogger(__name__)
+
+
+_MAX_CONTENT = 300
+_SUMMARY_MAX_CHARS = 400
+_DEFAULT_CONFIG = {
+    "db_path": "./feed_mcp.sqlite3",
+    "poll_ttl_seconds": 300,
+    "content_ack_ttl_hours": 48,
+    "item_retention_hours": 72,
+    "uninterested_item_retention_hours": 48,
+    "general_item_retention_hours": 168,
+    "proactive_published_within_hours": 36,
+    "max_items_per_source": 100,
+    "max_content_events": 50,
+}
+
+
+@dataclass
+class FeedMcpConfig:
+    db_path: Path
+    poll_ttl_seconds: int
+    content_ack_ttl_hours: int
+    item_retention_hours: int
+    general_item_retention_hours: int
+    proactive_published_within_hours: int
+    max_items_per_source: int
+    max_content_events: int
+
+
+def _config_path() -> Path:
+    return Path(__file__).resolve().parent.parent / "feed_mcp.json"
+
+def load_config() -> FeedMcpConfig:
+    raw = dict(_DEFAULT_CONFIG)
+    path = _config_path()
+    if path.exists():
+        raw.update(json.loads(path.read_text()))
+    db_path = Path(str(raw["db_path"]))
+    if not db_path.is_absolute():
+        db_path = (path.parent / db_path).resolve()
+    return FeedMcpConfig(
+        db_path=db_path,
+        poll_ttl_seconds=max(60, int(raw["poll_ttl_seconds"])),
+        content_ack_ttl_hours=max(
+            1,
+            int(raw.get("content_ack_ttl_hours", int(raw.get("content_ack_ttl_days", 7)) * 24)),
+        ),
+        item_retention_hours=max(
+            1,
+            int(raw.get("item_retention_hours", int(raw.get("item_retention_days", 3)) * 24)),
+        ),
+        general_item_retention_hours=max(1, int(raw.get("general_item_retention_hours", 168))),
+        proactive_published_within_hours=max(1, int(raw.get("proactive_published_within_hours", 36))),
+        max_items_per_source=max(1, int(raw.get("max_items_per_source", 100))),
+        max_content_events=max(1, int(raw["max_content_events"])),
+    )
+
+
+def _connect(cfg: FeedMcpConfig) -> sqlite3.Connection:
+    cfg.db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(cfg.db_path)
+    conn.row_factory = sqlite3.Row
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS sources (
+            id TEXT PRIMARY KEY,
+            type TEXT NOT NULL,
+            name TEXT NOT NULL,
+            url TEXT NOT NULL,
+            note TEXT,
+            enabled INTEGER NOT NULL,
+            poll_interval_seconds INTEGER NOT NULL,
+            added_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS items (
+            event_id TEXT PRIMARY KEY,
+            source_id TEXT NOT NULL,
+            source_name TEXT NOT NULL,
+            source_type TEXT NOT NULL,
+            title TEXT,
+            content TEXT NOT NULL,
+            url TEXT,
+            author TEXT,
+            published_at TEXT,
+            first_seen_at TEXT NOT NULL,
+            last_seen_at TEXT NOT NULL,
+            emitted_at TEXT,
+            content_hash TEXT NOT NULL
+        )
+        """
+    )
+    columns = {
+        str(row["name"])
+        for row in conn.execute("PRAGMA table_info(items)").fetchall()
+    }
+    if "author" not in columns:
+        conn.execute("ALTER TABLE items ADD COLUMN author TEXT")
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS metadata (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS acked_items (
+            event_id TEXT PRIMARY KEY,
+            acked_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute("DROP TABLE IF EXISTS pending_items")
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS poll_state (
+            source_id TEXT PRIMARY KEY,
+            last_polled_at TEXT,
+            last_success_at TEXT,
+            last_error TEXT
+        )
+        """
+    )
+    _normalize_existing_source_urls(conn)
+    _normalize_existing_item_urls(conn)
+    _normalize_existing_xcancel_items(conn)
+    return conn
+
+
+def _now() -> datetime:
+    return datetime.now(UTC)
+
+
+def _cleanup(conn: sqlite3.Connection, cfg: FeedMcpConfig) -> None:
+    now = _now()
+    conn.execute(
+        "DELETE FROM acked_items WHERE expires_at <= ?",
+        (now.isoformat(),),
+    )
+    _delete_expired_items(conn, cfg, now)
+    _trim_items_per_source(conn, cfg.max_items_per_source)
+    conn.commit()
+
+
+def _delete_expired_items(conn: sqlite3.Connection, cfg: FeedMcpConfig, now: datetime) -> None:
+    general_cutoff = (now - timedelta(hours=cfg.general_item_retention_hours)).isoformat()
+    fallback_cutoff = (now - timedelta(hours=cfg.item_retention_hours)).isoformat()
+    # 按通用保留期清理内容，优先使用 published_at。
+    conn.execute(
+        """
+        DELETE FROM items
+        WHERE coalesce(published_at, last_seen_at) <= ?
+        """,
+        (general_cutoff,),
+    )
+    # 用旧的 last_seen_at 兜底，避免无发布时间脏数据长期滞留。
+    conn.execute(
+        """
+        DELETE FROM items
+        WHERE published_at IS NULL
+          AND last_seen_at <= ?
+        """,
+        (fallback_cutoff,),
+    )
+
+
+def _trim_items_per_source(conn: sqlite3.Connection, max_items_per_source: int) -> None:
+    rows = conn.execute(
+        """
+        SELECT event_id, source_id
+        FROM items
+        ORDER BY coalesce(published_at, last_seen_at) DESC, last_seen_at DESC
+        """
+    ).fetchall()
+    keep_counts: dict[str, int] = {}
+    to_delete: list[str] = []
+    for row in rows:
+        source_id = str(row["source_id"])
+        keep_counts[source_id] = keep_counts.get(source_id, 0) + 1
+        if keep_counts[source_id] > max_items_per_source:
+            to_delete.append(str(row["event_id"]))
+    if not to_delete:
+        return
+    conn.executemany("DELETE FROM items WHERE event_id = ?", [(event_id,) for event_id in to_delete])
+
+
+def _delete_source_history(conn: sqlite3.Connection, source_ids: list[str]) -> tuple[int, int]:
+    if not source_ids:
+        return 0, 0
+    source_placeholders = ",".join("?" for _ in source_ids)
+    event_rows = conn.execute(
+        f"SELECT event_id FROM items WHERE source_id IN ({source_placeholders})",
+        source_ids,
+    ).fetchall()
+    event_ids = [str(row["event_id"]) for row in event_rows]
+
+    deleted_acked = 0
+    if event_ids:
+        event_placeholders = ",".join("?" for _ in event_ids)
+        cursor = conn.execute(
+            f"DELETE FROM acked_items WHERE event_id IN ({event_placeholders})",
+            event_ids,
+        )
+        deleted_acked = max(0, cursor.rowcount)
+
+    cursor = conn.execute(
+        f"DELETE FROM items WHERE source_id IN ({source_placeholders})",
+        source_ids,
+    )
+    deleted_items = max(0, cursor.rowcount)
+    conn.execute(
+        f"DELETE FROM poll_state WHERE source_id IN ({source_placeholders})",
+        source_ids,
+    )
+    return deleted_items, deleted_acked
+
+
+def _stable_event_id(source_id: str, url: str, title: str, published_at: str | None) -> str:
+    raw = "|".join([source_id, _canonical_item_key(url or ""), title or "", published_at or ""])
+    return "fmcp_" + hashlib.sha1(raw.encode()).hexdigest()[:16]
+
+
+def _normalize_item_url(url: str | None) -> str | None:
+    raw = (url or "").strip()
+    if not raw:
+        return None
+    normalized_x_url = _normalize_x_status_url(raw)
+    if normalized_x_url:
+        return normalized_x_url
+    return raw
+
+
+def _canonical_item_key(url: str) -> str:
+    raw = (url or "").strip()
+    if not raw:
+        return ""
+    status_id = _extract_x_status_id(raw)
+    if status_id:
+        return f"xstatus:{status_id}"
+    return raw
+
+
+def _extract_x_status_id(url: str) -> str | None:
+    parsed = urlparse((url or "").strip())
+    host = (parsed.netloc or "").lower()
+    if host not in {
+        "twitter.com",
+        "www.twitter.com",
+        "x.com",
+        "www.x.com",
+        "xcancel.com",
+        "rss.xcancel.com",
+        "nitter.net",
+        "www.nitter.net",
+    }:
+        return None
+    match = re.search(r"/status/(\d+)", parsed.path or "")
+    if not match:
+        return None
+    return match.group(1)
+
+
+def _normalize_x_status_url(url: str) -> str | None:
+    parsed = urlparse((url or "").strip())
+    host = (parsed.netloc or "").lower()
+    if host not in {
+        "twitter.com",
+        "www.twitter.com",
+        "x.com",
+        "www.x.com",
+        "mobile.twitter.com",
+        "mobile.x.com",
+        "xcancel.com",
+        "rss.xcancel.com",
+        "nitter.net",
+        "www.nitter.net",
+    }:
+        return None
+    match = re.search(r"/([^/]+)/status/(\d+)", parsed.path or "")
+    if not match:
+        return None
+    username = match.group(1).lstrip("@")
+    status_id = match.group(2)
+    return f"https://nitter.net/{username}/status/{status_id}#m"
+
+
+def _normalize_source_url(url: str) -> str:
+    raw = (url or "").strip()
+    if not raw:
+        return raw
+    username = _extract_x_username(raw)
+    if username:
+        return f"https://nitter.net/{username}/rss"
+    return raw
+
+
+def _extract_x_username(url: str) -> str | None:
+    parsed = urlparse((url or "").strip())
+    host = (parsed.netloc or "").lower()
+    if host not in {
+        "twitter.com",
+        "www.twitter.com",
+        "x.com",
+        "www.x.com",
+        "mobile.twitter.com",
+        "mobile.x.com",
+        "xcancel.com",
+        "rss.xcancel.com",
+        "nitter.net",
+        "www.nitter.net",
+    }:
+        return None
+    parts = [part for part in (parsed.path or "").split("/") if part]
+    if not parts:
+        return None
+    first = parts[0]
+    if first.lower() in {"home", "explore", "search", "i", "intent", "share", "hashtag"}:
+        return None
+    return first.lstrip("@") or None
+
+
+def _normalize_existing_xcancel_items(conn: sqlite3.Connection) -> None:
+    rows = conn.execute(
+        """
+        SELECT event_id, source_id, title, published_at, url
+        FROM items
+        WHERE url LIKE '%twitter.com/%'
+           OR url LIKE '%x.com/%'
+           OR url LIKE '%xcancel.com/%'
+        """
+    ).fetchall()
+    for row in rows:
+        normalized_event_id = _stable_event_id(
+            str(row["source_id"]),
+            str(row["url"] or ""),
+            str(row["title"] or ""),
+            str(row["published_at"] or "").strip() or None,
+        )
+        if normalized_event_id != row["event_id"]:
+            exists = conn.execute(
+                "SELECT 1 FROM items WHERE event_id = ? LIMIT 1",
+                (normalized_event_id,),
+            ).fetchone()
+            if exists is not None:
+                conn.execute("DELETE FROM items WHERE event_id = ?", (row["event_id"],))
+                continue
+        conn.execute(
+            "UPDATE items SET event_id = ? WHERE event_id = ?",
+            (normalized_event_id, row["event_id"]),
+        )
+    conn.commit()
+
+
+def _normalize_existing_item_urls(conn: sqlite3.Connection) -> None:
+    rows = conn.execute(
+        """
+        SELECT event_id, url
+        FROM items
+        WHERE url LIKE '%twitter.com/%'
+           OR url LIKE '%x.com/%'
+           OR url LIKE '%xcancel.com/%'
+        """
+    ).fetchall()
+    for row in rows:
+        normalized_url = _normalize_item_url(str(row["url"] or ""))
+        if not normalized_url or normalized_url == row["url"]:
+            continue
+        conn.execute(
+            "UPDATE items SET url = ? WHERE event_id = ?",
+            (normalized_url, str(row["event_id"])),
+        )
+    conn.commit()
+
+
+def _normalize_existing_source_urls(conn: sqlite3.Connection) -> None:
+    rows = conn.execute("SELECT id, url FROM sources").fetchall()
+    for row in rows:
+        normalized_url = _normalize_source_url(str(row["url"] or ""))
+        if normalized_url == row["url"]:
+            continue
+        duplicate = conn.execute(
+            "SELECT id FROM sources WHERE url = ? AND id != ? LIMIT 1",
+            (normalized_url, str(row["id"])),
+        ).fetchone()
+        if duplicate is not None:
+            conn.execute("DELETE FROM sources WHERE id = ?", (str(row["id"]),))
+            continue
+        conn.execute(
+            "UPDATE sources SET url = ?, updated_at = ? WHERE id = ?",
+            (normalized_url, _now().isoformat(), str(row["id"])),
+        )
+    conn.commit()
+
+
+def _parse_dt(value: str | None) -> str | None:
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=UTC)
+        return dt.isoformat()
+    except Exception:
+        pass
+    try:
+        dt = parsedate_to_datetime(value)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=UTC)
+        return dt.isoformat()
+    except Exception:
+        return None
+
+
+def _strip(text: str | None) -> str:
+    return (text or "").strip()
+
+
+def _parse_rss(xml_text: str) -> list[dict[str, str | None]]:
+    xml_text = _normalize_xml_text(xml_text)
+    if _is_xcancel_whitelist_feed(xml_text):
+        return []
+    root = ET.fromstring(xml_text)
+    items: list[dict[str, str | None]] = []
+    if root.tag.endswith("feed"):
+        ns = {"a": root.tag.split("}")[0].strip("{")} if "}" in root.tag else {}
+        for entry in root.findall("a:entry" if ns else "entry", ns):
+            link = None
+            for link_el in entry.findall("a:link" if ns else "link", ns):
+                href = link_el.attrib.get("href")
+                rel = link_el.attrib.get("rel", "alternate")
+                if href and rel == "alternate":
+                    link = href
+                    break
+            items.append(
+                {
+                    "title": _strip((entry.findtext("a:title", default="", namespaces=ns) if ns else entry.findtext("title"))),
+                    "content": _strip_html(_strip(
+                        (entry.findtext("a:summary", default="", namespaces=ns) if ns else entry.findtext("summary"))
+                        or (entry.findtext("a:content", default="", namespaces=ns) if ns else entry.findtext("content"))
+                    ))[:_MAX_CONTENT],
+                    "url": link,
+                    "author": _strip(
+                        (entry.findtext("a:author/a:name", default="", namespaces=ns) if ns else "")
+                        or (entry.findtext("author/name") if not ns else "")
+                    ) or None,
+                    "published_at": _parse_dt(
+                        (entry.findtext("a:published", default="", namespaces=ns) if ns else entry.findtext("published"))
+                        or (entry.findtext("a:updated", default="", namespaces=ns) if ns else entry.findtext("updated"))
+                    ),
+                }
+            )
+        return items
+    for item in root.findall(".//item"):
+        items.append(
+            {
+                "title": _strip(item.findtext("title")),
+                "content": _strip_html(
+                    _strip(item.findtext("description")) or _strip(item.findtext("content:encoded"))
+                )[:_MAX_CONTENT],
+                "url": _strip(item.findtext("link")) or None,
+                "author": _strip(item.findtext("author")) or _strip(item.findtext("dc:creator")) or None,
+                "published_at": _parse_dt(_strip(item.findtext("pubDate"))),
+            }
+        )
+    return items
+
+
+def _normalize_xml_text(text: str) -> str:
+    return (text or "").lstrip("\ufeff\r\n\t ")
+
+
+def _is_xcancel_whitelist_feed(text: str) -> bool:
+    return "rss reader not yet whitelisted" in (text or "").lower()
+
+
+def _strip_html(text: str) -> str:
+    text = re.sub(r"<[^>]+>", " ", text or "")
+    text = re.sub(r"&amp;", "&", text)
+    text = re.sub(r"&lt;", "<", text)
+    text = re.sub(r"&gt;", ">", text)
+    text = re.sub(r"&nbsp;", " ", text)
+    text = re.sub(r"&#?\w+;", "", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _read_local_text(url: str) -> str:
+    parsed = urlparse(url)
+    local_path = unquote(parsed.path or "")
+    return Path(local_path).read_text(encoding="utf-8")
+
+
+def _trace_id_short() -> str:
+    return uuid.uuid4().hex[:8]
+
+
+def _err_text(err: Exception) -> str:
+    return f"{type(err).__name__}: {err}"
+
+
+def _fetch_rss_text(url: str, *, trace_id: str, source_name: str) -> str:
+    if url.startswith("file://"):
+        logger.info("[feed][trace=%s] source=%s fetch via local_file", trace_id, source_name)
+        return _read_local_text(url)
+    if "xcancel.com" in url:
+        return _fetch_via_curl(url, trace_id=trace_id, source_name=source_name)
+    return _fetch_via_requests(url, trace_id=trace_id, source_name=source_name)
+
+
+def _fetch_via_requests(url: str, *, trace_id: str, source_name: str) -> str:
+    last_err: Exception | None = None
+    attempts = (0.0, 0.3)
+    for idx, delay in enumerate(attempts, start=1):
+        if delay > 0:
+            time.sleep(delay)
+        try:
+            logger.info(
+                "[feed][trace=%s] source=%s fetch(requests) attempt=%d/%d",
+                trace_id,
+                source_name,
+                idx,
+                len(attempts),
+            )
+            resp = requests.get(
+                url,
+                timeout=15,
+                headers={
+                    "User-Agent": "FreshRSS/1.24.0",
+                    "Accept": "application/rss+xml, application/atom+xml, application/xml;q=0.9, text/xml;q=0.8, */*;q=0.5",
+                },
+            )
+            resp.raise_for_status()
+            logger.info(
+                "[feed][trace=%s] source=%s fetch(requests) success attempt=%d bytes=%d",
+                trace_id,
+                source_name,
+                idx,
+                len(resp.text or ""),
+            )
+            return resp.text
+        except Exception as e:
+            last_err = e
+            logger.warning(
+                "[feed][trace=%s] source=%s fetch(requests) failed attempt=%d/%d err=%s",
+                trace_id,
+                source_name,
+                idx,
+                len(attempts),
+                _err_text(e),
+            )
+    raise last_err or RuntimeError("rss request failed")
+
+
+def _fetch_via_curl(url: str, *, trace_id: str, source_name: str) -> str:
+    last_err: Exception | None = None
+    attempts = (0.0, 0.3, 0.8)
+    for idx, delay in enumerate(attempts, start=1):
+        if delay > 0:
+            time.sleep(delay)
+        try:
+            logger.info(
+                "[feed][trace=%s] source=%s fetch(curl) attempt=%d/%d",
+                trace_id,
+                source_name,
+                idx,
+                len(attempts),
+            )
+            proc = subprocess.run(
+                [
+                    "curl",
+                    "-sS",
+                    "-L",
+                    "--max-time",
+                    "15",
+                    "-A",
+                    "FreshRSS/1.24.0",
+                    "-H",
+                    "Accept: */*",
+                    url,
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            logger.info(
+                "[feed][trace=%s] source=%s fetch(curl) success attempt=%d bytes=%d",
+                trace_id,
+                source_name,
+                idx,
+                len(proc.stdout or ""),
+            )
+            return proc.stdout
+        except Exception as e:
+            last_err = e
+            logger.warning(
+                "[feed][trace=%s] source=%s fetch(curl) failed attempt=%d/%d err=%s",
+                trace_id,
+                source_name,
+                idx,
+                len(attempts),
+                _err_text(e),
+            )
+    raise last_err or RuntimeError("curl fetch failed")
+
+
+def _resolve_kb_root(url: str) -> Path | None:
+    if not url:
+        return None
+    if url.startswith("file://"):
+        path_str = url[len("file://") :]
+    else:
+        path_str = url
+    path = Path(path_str)
+    if not path.is_absolute():
+        return None
+    return path
+
+
+def _extract_body(text: str, max_chars: int) -> str:
+    lines = text.splitlines()
+    body_lines: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if re.match(r"^#{1,2}\s", stripped):
+            continue
+        if re.match(r"^-\s+\w[\w\s]*:", stripped):
+            continue
+        body_lines.append(line)
+    body = "\n".join(body_lines).strip()
+    body = re.sub(r"\n{3,}", "\n\n", body)
+    if len(body) <= max_chars:
+        return body
+    return body[:max_chars].rstrip() + "…"
+
+
+def _fetch_novel_items(source: sqlite3.Row, limit: int) -> list[dict[str, str | None]]:
+    kb_root = _resolve_kb_root(str(source["url"]))
+    if kb_root is None:
+        return []
+    index_path = kb_root / "summaries" / "index.json"
+    if not index_path.exists():
+        return []
+    index = json.loads(index_path.read_text(encoding="utf-8"))
+    chunks = index.get("chunks", [])
+    recent = sorted(chunks, key=lambda c: c.get("created_at", ""), reverse=True)[:limit]
+    items: list[dict[str, str | None]] = []
+    kb_name = kb_root.name
+    for rec in recent:
+        chunk_id = str(rec.get("chunk_id", "") or "").strip()
+        if not chunk_id:
+            continue
+        summary_rel = str(rec.get("summary_file", "") or "").strip()
+        summary_path = (
+            kb_root / summary_rel
+            if summary_rel
+            else kb_root / "summaries" / "chunks" / f"{chunk_id}.summary.md"
+        )
+        if not summary_path.exists():
+            continue
+        raw = summary_path.read_text(encoding="utf-8")
+        content = _extract_body(raw, _SUMMARY_MAX_CHARS)
+        if not content:
+            continue
+        segment = rec.get("segment") or rec.get("route", "")
+        items.append(
+            {
+                "title": f"[{source['name']}·{segment}] {chunk_id}",
+                "content": content,
+                "url": f"novel://{kb_name}/{chunk_id}",
+                "author": None,
+                "published_at": _parse_dt(str(rec.get("created_at") or "")),
+            }
+        )
+    return items
+
+
+def _fetch_source_items(source: sqlite3.Row, limit: int, *, trace_id: str) -> list[dict[str, str | None]]:
+    source_name = str(source["name"])
+    source_type = str(source["type"] or "rss").strip().lower()
+    if source_type == "novel-kb":
+        items = _fetch_novel_items(source, limit)
+        logger.info(
+            "[feed][trace=%s] source=%s fetch(novel-kb) done items=%d",
+            trace_id,
+            source_name,
+            len(items),
+        )
+        return items
+    last_err: Exception | None = None
+    attempts = (0.0, 0.3)
+    for idx, delay in enumerate(attempts, start=1):
+        if delay > 0:
+            time.sleep(delay)
+        try:
+            logger.info(
+                "[feed][trace=%s] source=%s parse attempt=%d/%d",
+                trace_id,
+                source_name,
+                idx,
+                len(attempts),
+            )
+            text = _fetch_rss_text(str(source["url"]), trace_id=trace_id, source_name=source_name)
+            items = _parse_rss(text)[:limit]
+            logger.info(
+                "[feed][trace=%s] source=%s parse success attempt=%d items=%d",
+                trace_id,
+                source_name,
+                idx,
+                len(items),
+            )
+            return items
+        except ET.ParseError as e:
+            last_err = e
+            logger.warning(
+                "[feed][trace=%s] source=%s parse failed attempt=%d/%d err=%s",
+                trace_id,
+                source_name,
+                idx,
+                len(attempts),
+                _err_text(e),
+            )
+        except Exception as e:
+            last_err = e
+            logger.warning(
+                "[feed][trace=%s] source=%s fetch_or_parse failed attempt=%d/%d err=%s",
+                trace_id,
+                source_name,
+                idx,
+                len(attempts),
+                _err_text(e),
+            )
+    raise last_err or RuntimeError("source fetch failed")
+
+
+def _poll_source(
+    conn: sqlite3.Connection,
+    cfg: FeedMcpConfig,
+    source: sqlite3.Row,
+    *,
+    force: bool = False,
+    trace_id: str = "",
+) -> None:
+    now = _now()
+    source_id = str(source["id"])
+    source_name = str(source["name"])
+    poll_state = conn.execute(
+        "SELECT last_polled_at FROM poll_state WHERE source_id = ?",
+        (source_id,),
+    ).fetchone()
+    if not force and poll_state and poll_state["last_polled_at"]:
+        last_polled = datetime.fromisoformat(str(poll_state["last_polled_at"]))
+        elapsed_s = int((now - last_polled).total_seconds())
+        poll_interval_s = int(source["poll_interval_seconds"])
+        if elapsed_s < poll_interval_s:
+            remain_s = max(0, poll_interval_s - elapsed_s)
+            logger.info(
+                "[feed][trace=%s] source=%s skipped by interval remain=%ss",
+                trace_id,
+                source_name,
+                remain_s,
+            )
+            return
+
+    # 1. 按 source_type 拉取原始条目（rss / novel-kb），使用静态抓取上限。
+    parsed = _fetch_source_items(source, cfg.max_content_events, trace_id=trace_id)
+    parsed_count = len(parsed)
+    valid_count = 0
+    skipped_empty_count = 0
+    inserted_count = 0
+    updated_count = 0
+    sample_titles: list[str] = []
+
+    # 2. 规范化条目并写入 sqlite，统计本轮新增/更新情况。
+    for item in parsed:
+        title = str(item.get("title") or "").strip()
+        content = str(item.get("content") or "").strip()
+        url = _normalize_item_url(item.get("url"))
+        author = str(item.get("author") or "").strip() or None
+        published_at = str(item.get("published_at") or "").strip() or None
+        if not (title or content):
+            skipped_empty_count += 1
+            continue
+        valid_count += 1
+        display_title = (title or content).replace("\n", " ").strip()
+        if display_title and len(sample_titles) < 3:
+            sample_titles.append(display_title[:80])
+
+        event_id = _stable_event_id(source_id, url or "", title, published_at)
+        exists = conn.execute(
+            "SELECT 1 FROM items WHERE event_id = ? LIMIT 1",
+            (event_id,),
+        ).fetchone()
+        if exists:
+            updated_count += 1
+        else:
+            inserted_count += 1
+
+        content_hash = hashlib.sha1((title + "\n" + content).encode()).hexdigest()[:16]
+        conn.execute(
+            """
+            INSERT INTO items (
+                event_id, source_id, source_name, source_type, title, content, url,
+                author, published_at, first_seen_at, last_seen_at, emitted_at, content_hash
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(event_id) DO UPDATE SET
+                source_name=excluded.source_name,
+                title=excluded.title,
+                content=excluded.content,
+                url=excluded.url,
+                author=excluded.author,
+                published_at=excluded.published_at,
+                last_seen_at=excluded.last_seen_at,
+                content_hash=excluded.content_hash
+            """,
+            (
+                event_id,
+                source_id,
+                str(source["name"]),
+                str(source["type"] or "rss"),
+                title or None,
+                content or title,
+                url,
+                author,
+                published_at,
+                now.isoformat(),
+                now.isoformat(),
+                None,
+                content_hash,
+            ),
+        )
+
+    # 3. 更新 poll 状态并输出本轮摘要日志，便于排查“是否真的拉到内容”。
+    conn.execute(
+        """
+        INSERT INTO poll_state (source_id, last_polled_at, last_success_at, last_error)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(source_id) DO UPDATE SET
+            last_polled_at=excluded.last_polled_at,
+            last_success_at=excluded.last_success_at,
+            last_error=NULL
+        """,
+        (source_id, now.isoformat(), now.isoformat(), None),
+    )
+    conn.commit()
+    logger.info(
+        "[feed][trace=%s] source=%s poll done parsed=%d valid=%d inserted=%d updated=%d skipped_empty=%d sample_titles=%s",
+        trace_id,
+        source_name,
+        parsed_count,
+        valid_count,
+        inserted_count,
+        updated_count,
+        skipped_empty_count,
+        sample_titles,
+    )
+
+
+def _poll_rows(
+    conn: sqlite3.Connection,
+    cfg: FeedMcpConfig,
+    rows: list[sqlite3.Row],
+    *,
+    force: bool,
+    trace_id: str = "",
+) -> dict[str, Any]:
+    failed_sources: list[str] = []
+    success_count = 0
+    for row in rows:
+        try:
+            _poll_source(conn, cfg, row, force=force, trace_id=trace_id)
+            success_count += 1
+        except Exception as e:
+            failed_sources.append(str(row["name"]))
+            logger.warning(
+                "[feed][trace=%s] poll failed source=%s err=%s",
+                trace_id,
+                row["name"],
+                _err_text(e),
+            )
+            conn.execute(
+                """
+                INSERT INTO poll_state (source_id, last_polled_at, last_success_at, last_error)
+                VALUES (?, ?, NULL, ?)
+                ON CONFLICT(source_id) DO UPDATE SET
+                    last_polled_at=excluded.last_polled_at,
+                    last_error=excluded.last_error
+                """,
+                (row["id"], _now().isoformat(), repr(e)),
+            )
+            conn.commit()
+    return {
+        "total": len(rows),
+        "success": success_count,
+        "failed": len(failed_sources),
+        "failed_sources": failed_sources,
+    }
+
+
+def feed_manage(action: str, name: str = "", url: str = "", source_type: str = "rss", note: str = "") -> str:
+    cfg = load_config()
+    conn = _connect(cfg)
+    try:
+        _cleanup(conn, cfg)
+        if action == "list":
+            rows = conn.execute(
+                "SELECT name, type, url, enabled, note FROM sources ORDER BY added_at DESC"
+            ).fetchall()
+            if not rows:
+                return "当前没有订阅任何信息源"
+            lines = [f"RSS 订阅列表（共 {len(rows)} 个）："]
+            for row in rows:
+                status = "启用" if int(row["enabled"]) else "停用"
+                note_text = f"  备注: {row['note']}" if row["note"] else ""
+                lines.append(f"  [{status}] {row['name']}  {row['url']}{note_text}")
+            return "\n".join(lines)
+
+        if action == "unsubscribe":
+            if not name.strip():
+                return "错误：unsubscribe 需要 name"
+            rows = conn.execute(
+                "SELECT id, name FROM sources WHERE lower(name) LIKE ? ORDER BY added_at DESC",
+                (f"%{name.strip().lower()}%",),
+            ).fetchall()
+            if not rows:
+                return f"没有找到名称包含 {name!r} 的订阅"
+            source_ids = [str(row["id"]) for row in rows]
+            deleted_items, deleted_acked = _delete_source_history(conn, source_ids)
+            conn.executemany("DELETE FROM sources WHERE id = ?", [(source_id,) for source_id in source_ids])
+            conn.commit()
+            names = "、".join(f"「{row['name']}」" for row in rows)
+            return (
+                f"已取消订阅：{names}"
+                f"（已清理 {deleted_items} 条历史内容，{deleted_acked} 条 ack 记录）"
+            )
+
+        if action == "subscribe":
+            if not name.strip() or not url.strip():
+                return "错误：subscribe 需要 name 和 url"
+            normalized_url = _normalize_source_url(url)
+            duplicate = conn.execute(
+                "SELECT id, name FROM sources WHERE url = ? LIMIT 1",
+                (normalized_url,),
+            ).fetchone()
+            if duplicate is not None:
+                return (
+                    f"已经订阅过该地址：{duplicate['name']!r}"
+                    f"（id: {str(duplicate['id'])[:8]}），无需重复添加"
+                )
+            now = _now().isoformat()
+            source_id = str(uuid.uuid4())
+            conn.execute(
+                """
+                INSERT INTO sources (id, type, name, url, note, enabled, poll_interval_seconds, added_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    source_id,
+                    source_type or "rss",
+                    name.strip(),
+                    normalized_url,
+                    note.strip() or None,
+                    1,
+                    cfg.poll_ttl_seconds,
+                    now,
+                    now,
+                ),
+            )
+            conn.commit()
+            return f"已订阅 {name.strip()!r}（类型={source_type or 'rss'} {normalized_url}），下次主动巡检时开始收集"
+        return "错误：action 必须是 subscribe|list|unsubscribe"
+    finally:
+        conn.close()
+
+
+def sync_legacy_subscriptions(json_path: str) -> dict[str, int]:
+    cfg = load_config()
+    conn = _connect(cfg)
+    inserted = 0
+    updated = 0
+    try:
+        # 1. 从旧 feeds.json 读取订阅列表，兼容历史本地 feed 配置。
+        path = Path(json_path).expanduser()
+        if not path.exists():
+            return {"inserted": 0, "updated": 0}
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(raw, list):
+            return {"inserted": 0, "updated": 0}
+        # 2. 按 URL 对齐到 feed-mcp 的 sources 表，避免迁移时重复插入。
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "").strip()
+            url = _normalize_source_url(str(item.get("url") or "").strip())
+            if not name or not url:
+                continue
+            row = conn.execute(
+                "SELECT id FROM sources WHERE url = ? LIMIT 1",
+                (url,),
+            ).fetchone()
+            payload = (
+                str(item.get("type") or "rss"),
+                name,
+                url,
+                str(item.get("note") or "").strip() or None,
+                1 if bool(item.get("enabled", True)) else 0,
+                cfg.poll_ttl_seconds,
+                str(item.get("added_at") or _now().isoformat()),
+                _now().isoformat(),
+            )
+            if row is None:
+                source_id = str(item.get("id") or uuid.uuid4())
+                conn.execute(
+                    """
+                    INSERT INTO sources (id, type, name, url, note, enabled, poll_interval_seconds, added_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (source_id, *payload),
+                )
+                inserted += 1
+                continue
+            conn.execute(
+                """
+                UPDATE sources
+                SET type = ?, name = ?, note = ?, enabled = ?, poll_interval_seconds = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    payload[0],
+                    payload[1],
+                    payload[3],
+                    payload[4],
+                    payload[5],
+                    payload[7],
+                    str(row["id"]),
+                ),
+            )
+            updated += 1
+        conn.commit()
+        return {"inserted": inserted, "updated": updated}
+    finally:
+        conn.close()
+
+
+def feed_query(
+    action: str,
+    source: str = "",
+    keyword: str = "",
+    limit: int = 5,
+    page: int = 1,
+    page_size: int = 20,
+) -> str:
+    cfg = load_config()
+    conn = _connect(cfg)
+    try:
+        trace_id = _trace_id_short()
+        # 1. 查询工具尽量复刻旧逻辑：每次查询前都主动刷新启用源，而不是只看旧缓存。
+        _cleanup(conn, cfg)
+        enabled_rows = conn.execute(
+            "SELECT * FROM sources WHERE enabled = 1 ORDER BY added_at DESC"
+        ).fetchall()
+        limit = max(1, min(int(limit or 5), 30))
+        source_like = f"%{source.strip().lower()}%" if source else None
+        if source_like:
+            enabled_rows = [
+                row for row in enabled_rows if source.strip().lower() in str(row["name"]).lower()
+            ]
+        if not enabled_rows:
+            return "没有匹配的启用订阅"
+        summary = _poll_rows(conn, cfg, enabled_rows, force=True, trace_id=trace_id)
+        logger.info(
+            "[feed][trace=%s] feed_query force_poll summary total=%d success=%d failed=%d failed_sources=%s",
+            trace_id,
+            int(summary["total"]),
+            int(summary["success"]),
+            int(summary["failed"]),
+            summary["failed_sources"],
+        )
+        # 2. 刷新完成后再重新做查询，确保 latest/search/catalog 的时效性尽量贴近旧实现。
+        if action == "summary":
+            source_names = sorted({str(row["name"]) for row in enabled_rows if row["name"]})
+            names = "（无）"
+            if source_names:
+                shown = source_names[:50]
+                names = "、".join(shown)
+                if len(source_names) > 50:
+                    names += f" …（其余 {len(source_names) - 50} 个省略）"
+            total_items = conn.execute(
+                "SELECT COUNT(*) FROM items WHERE source_name IN (%s)" % ",".join("?" * len(enabled_rows)),
+                [str(row["name"]) for row in enabled_rows],
+            ).fetchone()[0]
+            return (
+                f"订阅概况：sources={len(enabled_rows)} items={total_items} 来源={names}。"
+                "如需逐条订阅 URL 与启用状态，请使用 feed_manage(action=list)。"
+            )
+        if action == "catalog":
+            page = max(1, int(page or 1))
+            page_size = max(1, min(int(page_size or 20), 100))
+            rows = conn.execute(
+                """
+                SELECT source_name, title, url, published_at, last_seen_at
+                FROM items
+                WHERE 1=1
+                LIMIT ? OFFSET ?
+                """,
+                (page_size, (page - 1) * page_size),
+            ).fetchall()
+            base_sql = """
+                SELECT source_name, title, url, published_at, last_seen_at
+                FROM items
+                WHERE 1=1
+            """
+            params: list[Any] = []
+            if source_like:
+                base_sql += " AND lower(source_name) LIKE ?"
+                params.append(source_like)
+            total = conn.execute(
+                f"SELECT COUNT(*) FROM ({base_sql})",
+                params,
+            ).fetchone()[0]
+            paged = conn.execute(
+                base_sql + " ORDER BY coalesce(published_at, last_seen_at) DESC LIMIT ? OFFSET ?",
+                params + [page_size, (page - 1) * page_size],
+            ).fetchall()
+            if (page - 1) * page_size >= total and total > 0:
+                return json.dumps(
+                    {
+                        "action": "catalog",
+                        "source": source or None,
+                        "page": page,
+                        "page_size": page_size,
+                        "total": total,
+                        "has_more": False,
+                        "next_page": None,
+                        "items": [],
+                        "error": "page out of range",
+                    },
+                    ensure_ascii=False,
+                )
+            payload_items = [
+                {
+                    "source": row["source_name"],
+                    "title": row["title"] or "(无标题)",
+                    "url": row["url"] or "",
+                    "published_at": row["published_at"],
+                }
+                for row in paged
+            ]
+            return json.dumps(
+                {
+                    "action": "catalog",
+                    "source": source or None,
+                    "page": page,
+                    "page_size": page_size,
+                    "total": total,
+                    "has_more": (page * page_size) < total,
+                    "next_page": (page + 1) if (page * page_size) < total else None,
+                    "items": payload_items,
+                },
+                ensure_ascii=False,
+            )
+        query_sql = """
+            SELECT source_name, title, content, url, author, published_at, last_seen_at
+            FROM items
+            WHERE 1=1
+        """
+        params: list[Any] = []
+        if source_like:
+            query_sql += " AND lower(source_name) LIKE ?"
+            params.append(source_like)
+        if action == "search" and keyword.strip():
+            query_sql += " AND (lower(title) LIKE ? OR lower(content) LIKE ?)"
+            like = f"%{keyword.strip().lower()}%"
+            params.extend([like, like])
+        if action == "search" and not keyword.strip():
+            return "错误：search 需要 keyword"
+        query_sql += " ORDER BY coalesce(published_at, last_seen_at) DESC LIMIT ?"
+        params.append(limit)
+        rows = conn.execute(query_sql, params).fetchall()
+        if not rows:
+            return "没有找到匹配条目"
+        lines: list[str] = []
+        for row in rows:
+            raw_ts = row["published_at"] or row["last_seen_at"]
+            ts = "未知时间"
+            if raw_ts:
+                try:
+                    ts = datetime.fromisoformat(str(raw_ts)).astimezone().strftime("%Y-%m-%d %H:%M")
+                except Exception:
+                    ts = str(raw_ts)
+            lines.append(f"- [{row['source_name']}] {row['title'] or '(无标题)'} ({ts})")
+            if row["url"]:
+                lines.append(f"  {row['url']}")
+        return "\n".join(lines)
+    finally:
+        conn.close()
+
+
+def _build_display_text(row: sqlite3.Row) -> str:
+    """为单条 item 生成预格式化展示文本，供 proactive LLM 直接使用。
+
+    MCP 侧控制格式，proactive 侧无需感知内容类型细节。
+    url 同时保留在独立字段，proactive 会兜底追加以保证溯源链完整。
+    """
+    source = (row["source_name"] or "").strip()
+    title = (row["title"] or "（无标题）").strip()
+    header = f"[{source}] {title}" if source else title
+    content = (row["content"] or "").strip().replace("\n", " ")
+    if len(content) > 300:
+        content = content[:300] + "..."
+    parts = [header]
+    if content:
+        parts.append(content)
+    if row["url"]:
+        parts.append(f"原文链接: {row['url']}")
+    return "\n".join(parts)
+
+
+def poll_feeds_only() -> None:
+    """按需轮询所有启用源（尊重 poll_ttl_seconds），不返回内容。
+    由 proactive loop 按固定周期调用，与 get_proactive_events 完全解耦。
+    单源失败已在 _poll_rows 内部隔离；系统级异常（DB 不可用、配置损坏等）直接上抛，
+    由调用方决定如何处理，避免故障被静默吞掉。
+    """
+    cfg = load_config()
+    conn = _connect(cfg)
+    try:
+        trace_id = _trace_id_short()
+        _cleanup(conn, cfg)
+        sources = conn.execute(
+            "SELECT * FROM sources WHERE enabled = 1 ORDER BY added_at DESC"
+        ).fetchall()
+        logger.info("[feed][trace=%s] poll_feeds_only: %d sources", trace_id, len(sources))
+        summary = _poll_rows(conn, cfg, sources, force=False, trace_id=trace_id)
+        conn.commit()
+        logger.info(
+            "[feed][trace=%s] poll_feeds_only done total=%d success=%d failed=%d failed_sources=%s",
+            trace_id,
+            int(summary["total"]),
+            int(summary["success"]),
+            int(summary["failed"]),
+            summary["failed_sources"],
+        )
+    finally:
+        conn.close()
+
+
+def get_proactive_events() -> list[dict[str, Any]]:
+    cfg = load_config()
+    conn = _connect(cfg)
+    try:
+        # 纯 DB 查询，不触发轮询。轮询由 proactive loop 通过 poll_feeds 工具独立驱动。
+        _cleanup(conn, cfg)
+        published_after = (_now() - timedelta(hours=cfg.proactive_published_within_hours)).isoformat()
+        # 2. 只返回"未 ack"的候选，时间窗口内的所有条目，去重由 agent 侧负责。
+        rows = conn.execute(
+            """
+            SELECT i.event_id, i.source_type, i.source_name, i.title, i.content, i.url, i.published_at
+            FROM items i
+            LEFT JOIN acked_items a ON a.event_id = i.event_id
+            WHERE a.event_id IS NULL
+              AND coalesce(i.published_at, i.first_seen_at) >= ?
+            ORDER BY coalesce(i.published_at, i.first_seen_at) DESC
+            LIMIT ?
+            """,
+            (published_after, cfg.max_content_events),
+        ).fetchall()
+        return [
+            {
+                "event_id": row["event_id"],
+                "kind": "content",
+                "source_type": row["source_type"],
+                "source_name": row["source_name"],
+                "title": row["title"],
+                "content": row["content"],
+                "url": row["url"],
+                "published_at": row["published_at"],
+                "display_text": _build_display_text(row),
+            }
+            for row in rows
+        ]
+    finally:
+        conn.close()
+
+
+def acknowledge_events(event_ids: list[str], ttl_hours: int | None = None) -> dict[str, list[str]]:
+    cfg = load_config()
+    conn = _connect(cfg)
+    now = _now()
+    acked: list[str] = []
+    failed: list[str] = []
+    try:
+        effective_ttl = ttl_hours if ttl_hours is not None else cfg.content_ack_ttl_hours
+        _cleanup(conn, cfg)
+        for event_id in event_ids:
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO acked_items (event_id, acked_at, expires_at)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(event_id) DO UPDATE SET
+                        acked_at=excluded.acked_at,
+                        expires_at=excluded.expires_at
+                    """,
+                    (
+                        event_id,
+                        now.isoformat(),
+                        (now + timedelta(hours=effective_ttl)).isoformat(),
+                    ),
+                )
+                acked.append(event_id)
+            except Exception:
+                logger.exception("feed ack failed: %s", event_id)
+                failed.append(event_id)
+        conn.commit()
+        return {"acknowledged": acked, "failed": failed}
+    finally:
+        conn.close()
+
+
+def startup_force_poll() -> None:
+    """MCP 服务启动时主动拉一次所有启用源，忽略 poll_ttl 限制。"""
+    cfg = load_config()
+    conn = _connect(cfg)
+    try:
+        trace_id = _trace_id_short()
+        _cleanup(conn, cfg)
+        sources = conn.execute(
+            "SELECT * FROM sources WHERE enabled = 1 ORDER BY added_at DESC"
+        ).fetchall()
+        logger.info("[feed][trace=%s] startup force poll: %d sources", trace_id, len(sources))
+        summary = _poll_rows(conn, cfg, sources, force=True, trace_id=trace_id)
+        conn.commit()
+        logger.info(
+            "[feed][trace=%s] startup force poll done total=%d success=%d failed=%d failed_sources=%s",
+            trace_id,
+            int(summary["total"]),
+            int(summary["success"]),
+            int(summary["failed"]),
+            summary["failed_sources"],
+        )
+    except Exception as e:
+        logger.warning("[feed] startup force poll failed: %s", _err_text(e))
+    finally:
+        conn.close()

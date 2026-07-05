@@ -1,0 +1,11 @@
+{
+  "db_path": "./feed_mcp.sqlite3",
+  "poll_ttl_seconds": 300,
+  "content_ack_ttl_hours": 168,
+  "item_retention_hours": 72,
+  "uninterested_item_retention_hours": 48,
+  "general_item_retention_hours": 168,
+  "proactive_published_within_hours": 36,
+  "max_items_per_source": 100,
+  "max_content_events": 50
+}

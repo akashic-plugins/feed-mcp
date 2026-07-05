@@ -1,0 +1,30 @@
+{
+  "name": "feed",
+  "version": "0.1.0",
+  "description": "Feed MCP plugin with bundled feed skills",
+  "paths": {
+    "skills": [
+      "skills"
+    ],
+    "mcp_servers": [
+      "mcp/servers.json"
+    ]
+  },
+  "akashic": {
+    "runtime": {
+      "supports": [
+        "lifecycle",
+        "skills",
+        "mcp"
+      ]
+    },
+    "lifecycle": {
+      "entry": "plugin.py",
+      "class": "FeedPlugin",
+      "restart_required": true
+    },
+    "skills": {
+      "link_mode": "symlink"
+    }
+  }
+}
