@@ -141,8 +141,7 @@ def evaluate(
             f"""
             SELECT
                 event_id, source_id, source_type, source_name, title, content, url,
-                author, published_at, first_seen_at, served_count, last_served_at,
-                interest_ok
+                author, published_at, first_seen_at, interest_ok
             FROM items
             {where}
             """

@@ -37,20 +37,12 @@ _SUMMARY_MAX_CHARS = 400
 _DEFAULT_CONFIG = {
     "db_path": "./feed_mcp.sqlite3",
     "poll_ttl_seconds": 300,
-    "content_ack_ttl_hours": 48,
     "item_retention_hours": 72,
-    "uninterested_item_retention_hours": 48,
-    "general_item_retention_hours": 168,
-    "proactive_published_within_hours": 36,
     "max_items_per_source": 100,
     "max_content_events": 50,
     "rank_mode": "shadow",
     "rank_impression_limit": 5,
-    "rank_coarse_limit": 50,
     "rank_model_learning_rate": 0.08,
-    "rank_resurface_after_hours": 12,
-    "rank_freshness_half_life_hours": 36,
-    "rank_novelty_context_hours": 72,
 }
 
 
@@ -58,19 +50,12 @@ _DEFAULT_CONFIG = {
 class FeedMcpConfig:
     db_path: Path
     poll_ttl_seconds: int
-    content_ack_ttl_hours: int
     item_retention_hours: int
-    general_item_retention_hours: int
-    proactive_published_within_hours: int
     max_items_per_source: int
     max_content_events: int
     rank_mode: str
     rank_impression_limit: int
-    rank_coarse_limit: int
     rank_model_learning_rate: float
-    rank_resurface_after_hours: int
-    rank_freshness_half_life_hours: int
-    rank_novelty_context_hours: int
 
 
 def _config_path() -> Path:
@@ -96,25 +81,15 @@ def load_config() -> FeedMcpConfig:
     return FeedMcpConfig(
         db_path=db_path,
         poll_ttl_seconds=max(60, int(raw["poll_ttl_seconds"])),
-        content_ack_ttl_hours=max(
-            1,
-            int(raw.get("content_ack_ttl_hours", int(raw.get("content_ack_ttl_days", 7)) * 24)),
-        ),
         item_retention_hours=max(
             1,
             int(raw.get("item_retention_hours", int(raw.get("item_retention_days", 3)) * 24)),
         ),
-        general_item_retention_hours=max(1, int(raw.get("general_item_retention_hours", 168))),
-        proactive_published_within_hours=max(1, int(raw.get("proactive_published_within_hours", 36))),
         max_items_per_source=max(1, int(raw.get("max_items_per_source", 100))),
         max_content_events=max(1, int(raw["max_content_events"])),
         rank_mode=str(raw.get("rank_mode", "shadow")),
         rank_impression_limit=max(1, int(raw.get("rank_impression_limit", 5))),
-        rank_coarse_limit=max(1, int(raw.get("rank_coarse_limit", 50))),
         rank_model_learning_rate=max(0.001, float(raw.get("rank_model_learning_rate", 0.08))),
-        rank_resurface_after_hours=max(1, int(raw.get("rank_resurface_after_hours", 12))),
-        rank_freshness_half_life_hours=max(1, int(raw.get("rank_freshness_half_life_hours", 36))),
-        rank_novelty_context_hours=max(1, int(raw.get("rank_novelty_context_hours", 72))),
     )
 
 
@@ -166,12 +141,9 @@ def _connect(cfg: FeedMcpConfig) -> sqlite3.Connection:
         conn.execute("ALTER TABLE items ADD COLUMN interest_ok INTEGER")
     if "interest_scored_at" not in columns:
         conn.execute("ALTER TABLE items ADD COLUMN interest_scored_at TEXT")
-    if "served_count" not in columns:
-        conn.execute("ALTER TABLE items ADD COLUMN served_count INTEGER NOT NULL DEFAULT 0")
-    if "last_served_at" not in columns:
-        conn.execute("ALTER TABLE items ADD COLUMN last_served_at TEXT")
-    if "rank_score" not in columns:
-        conn.execute("ALTER TABLE items ADD COLUMN rank_score REAL")
+    for column in ("served_count", "last_served_at", "rank_score", "is_canonical"):
+        if column in columns:
+            conn.execute(f"ALTER TABLE items DROP COLUMN {column}")
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS metadata (
@@ -268,24 +240,13 @@ def _cleanup(conn: sqlite3.Connection, cfg: FeedMcpConfig) -> None:
 
 
 def _delete_expired_items(conn: sqlite3.Connection, cfg: FeedMcpConfig, now: datetime) -> None:
-    general_cutoff = (now - timedelta(hours=cfg.general_item_retention_hours)).isoformat()
-    fallback_cutoff = (now - timedelta(hours=cfg.item_retention_hours)).isoformat()
-    # 按通用保留期清理内容，优先使用 published_at。
+    cutoff = (now - timedelta(hours=cfg.item_retention_hours)).isoformat()
     conn.execute(
         """
         DELETE FROM items
         WHERE coalesce(published_at, last_seen_at) <= ?
         """,
-        (general_cutoff,),
-    )
-    # 用旧的 last_seen_at 兜底，避免无发布时间脏数据长期滞留。
-    conn.execute(
-        """
-        DELETE FROM items
-        WHERE published_at IS NULL
-          AND last_seen_at <= ?
-        """,
-        (fallback_cutoff,),
+        (cutoff,),
     )
 
 
@@ -1357,6 +1318,9 @@ def _build_display_text(row: sqlite3.Row) -> str:
 
 _TOKEN_RE = re.compile(r"[a-z0-9_+#.-]{2,}|[\u4e00-\u9fff]", re.IGNORECASE)
 _RANK_BIAS = -0.8
+_FRESHNESS_HALF_LIFE_HOURS = 36.0
+_EXPOSURE_RECENCY_HALF_LIFE_HOURS = 12.0
+_RECENT_CONTEXT_LIMIT = 100
 
 
 def _tokenize_rank_text(*parts: object) -> list[str]:
@@ -1504,10 +1468,10 @@ def _ensure_rank_model(conn: sqlite3.Connection, cfg: FeedMcpConfig) -> None:
         """
         SELECT
             event_id, source_id, source_name, author, title, content, published_at,
-            first_seen_at, served_count, last_served_at, interest_ok, interest_scored_at
+            first_seen_at, interest_ok, interest_scored_at
         FROM items
         WHERE interest_ok IN (0, 1)
-        ORDER BY coalesce(interest_scored_at, last_served_at, published_at, first_seen_at)
+        ORDER BY coalesce(interest_scored_at, published_at, first_seen_at)
         """
     ).fetchall()
     for row in rows:
@@ -1548,15 +1512,13 @@ def _parse_rank_dt(value: object) -> datetime | None:
 def _freshness_score(row: sqlite3.Row, cfg: FeedMcpConfig, now: datetime) -> tuple[float, float]:
     ts = _parse_rank_dt(row["published_at"]) or _parse_rank_dt(row["first_seen_at"]) or now
     age_hours = max(0.0, (now - ts).total_seconds() / 3600.0)
-    return math.exp(-age_hours / cfg.rank_freshness_half_life_hours), age_hours
+    return math.exp(-age_hours / _FRESHNESS_HALF_LIFE_HOURS), age_hours
 
 
 def _recent_context_tokens(
     conn: sqlite3.Connection,
-    cfg: FeedMcpConfig,
     now: datetime,
 ) -> list[set[str]]:
-    cutoff = (now - timedelta(hours=cfg.rank_novelty_context_hours)).isoformat()
     rows = conn.execute(
         """
         SELECT i.source_name, i.title, i.content
@@ -1565,14 +1527,13 @@ def _recent_context_tokens(
            OR i.event_id IN (
                 SELECT event_id
                 FROM rank_impressions
-                WHERE served_at >= ?
                 ORDER BY served_at DESC
-                LIMIT 200
+                LIMIT ?
            )
-        ORDER BY coalesce(i.interest_scored_at, i.last_served_at, i.published_at, i.first_seen_at) DESC
-        LIMIT 200
+        ORDER BY coalesce(i.interest_scored_at, i.published_at, i.first_seen_at) DESC
+        LIMIT ?
         """,
-        (cutoff,),
+        (_RECENT_CONTEXT_LIMIT, _RECENT_CONTEXT_LIMIT),
     ).fetchall()
     return [
         set(_tokenize_rank_text(row["source_name"], row["title"], row["content"]))
@@ -1598,6 +1559,38 @@ def _novelty_score(tokens: set[str], contexts: list[set[str]]) -> float:
         return 1.0
     max_overlap = max((_jaccard(tokens, ctx) for ctx in contexts), default=0.0)
     return max(0.05, 1.0 - max_overlap)
+
+
+def _exposure_decay(exposure_count: int, last_exposed_at: str | None, now: datetime) -> float:
+    count_decay = 1.0 / (1.0 + max(0, exposure_count))
+    last_seen = _parse_rank_dt(last_exposed_at)
+    if last_seen is None:
+        return count_decay
+    age_hours = max(0.0, (now - last_seen).total_seconds() / 3600.0)
+    recency_decay = 1.0 - math.exp(-age_hours / _EXPOSURE_RECENCY_HALF_LIFE_HOURS)
+    return count_decay * (0.05 + 0.95 * recency_decay)
+
+
+def _impression_summary(
+    conn: sqlite3.Connection,
+    event_ids: list[str],
+) -> dict[str, tuple[int, str | None]]:
+    if not event_ids:
+        return {}
+    placeholders = ",".join("?" for _ in event_ids)
+    rows = conn.execute(
+        f"""
+        SELECT event_id, COUNT(*) AS count, MAX(served_at) AS last_served_at
+        FROM rank_impressions
+        WHERE event_id IN ({placeholders})
+        GROUP BY event_id
+        """,
+        event_ids,
+    ).fetchall()
+    return {
+        str(row["event_id"]): (int(row["count"] or 0), row["last_served_at"])
+        for row in rows
+    }
 
 
 def _row_rank_tokens(row: sqlite3.Row) -> set[str]:
@@ -1636,6 +1629,8 @@ def _rank_candidate(
     contexts: list[set[str]],
     now: datetime,
     frontier: float,
+    exposure_count: int,
+    last_exposed_at: str | None,
 ) -> tuple[float, dict[str, float]]:
     tokens = _row_rank_tokens(row)
     information_density = min(1.0, len(tokens) / 16.0)
@@ -1654,8 +1649,7 @@ def _rank_candidate(
     author_prior = _accept_rate(author_pos, author_neg) if author else 0.5
     freshness, age_hours = _freshness_score(row, cfg, now)
     novelty = _novelty_score(tokens, contexts)
-    served_count = int(row["served_count"] or 0)
-    fatigue = 1.0 / (1.0 + served_count)
+    exposure_decay = _exposure_decay(exposure_count, last_exposed_at, now)
     z = (
         _RANK_BIAS
         + 2.2 * (source_prior - 0.5)
@@ -1669,7 +1663,7 @@ def _rank_candidate(
         * (0.25 + 0.75 * freshness)
         * (0.25 + 0.75 * novelty)
         * (0.25 + 0.75 * information_density)
-        * fatigue
+        * exposure_decay
         * frontier
     )
     features = {
@@ -1677,12 +1671,12 @@ def _rank_candidate(
         "freshness": freshness,
         "age_hours": age_hours,
         "novelty": novelty,
-        "fatigue": fatigue,
+        "exposure_decay": exposure_decay,
         "frontier": frontier,
         "source_prior": source_prior,
         "author_prior": author_prior,
         "token_log_odds": avg_token_log_odds,
-        "served_count": float(served_count),
+        "exposure_count": float(exposure_count),
         "information_density": information_density,
     }
     return score, features
@@ -1715,7 +1709,7 @@ def _model_feature_values(
         "frontier": float(coarse_features.get("frontier", 1.0)),
         "density": float(coarse_features.get("information_density", 0.0)),
         "source_prior": float(coarse_features.get("source_prior", 0.5)) - 0.5,
-        "served": min(1.0, float(coarse_features.get("served_count", 0.0)) / 5.0),
+        "exposed": min(1.0, float(coarse_features.get("exposure_count", 0.0)) / 5.0),
     }
     author = str(row["author"] or "").strip().lower()
     if author:
@@ -1740,7 +1734,11 @@ def _update_rank_model_for_row(
     interest_ok: int,
     updated_at: str,
 ) -> None:
-    contexts = _recent_context_tokens(conn, cfg, _now())
+    contexts = _recent_context_tokens(conn, _now())
+    exposure_count, last_exposed_at = _impression_summary(conn, [str(row["event_id"])]).get(
+        str(row["event_id"]),
+        (0, None),
+    )
     _coarse_score, coarse_features = _rank_candidate(
         conn,
         cfg,
@@ -1748,6 +1746,8 @@ def _update_rank_model_for_row(
         contexts,
         _now(),
         1.0,
+        exposure_count,
+        last_exposed_at,
     )
     _update_rank_model_weights(
         conn,
@@ -1765,8 +1765,9 @@ def _rank_rows(
     rows: list[sqlite3.Row],
     now: datetime,
 ) -> list[tuple[sqlite3.Row, float, dict[str, float]]]:
-    contexts = _recent_context_tokens(conn, cfg, now)
+    contexts = _recent_context_tokens(conn, now)
     frontier_by_id = _frontier_scores(rows, now)
+    impressions_by_id = _impression_summary(conn, [str(row["event_id"]) for row in rows])
     coarse_ranked = [
         (
             row,
@@ -1777,6 +1778,8 @@ def _rank_rows(
                 contexts,
                 now,
                 frontier_by_id.get(str(row["event_id"]), 1.0),
+                impressions_by_id.get(str(row["event_id"]), (0, None))[0],
+                impressions_by_id.get(str(row["event_id"]), (0, None))[1],
             ),
         )
         for row in rows
@@ -1788,15 +1791,23 @@ def _rank_rows(
         ),
         reverse=True,
     )
-    coarse_limit = max(cfg.max_content_events, cfg.rank_impression_limit, cfg.rank_coarse_limit)
+    coarse_limit = max(cfg.max_content_events, cfg.rank_impression_limit, cfg.max_content_events * 10)
     refined: list[tuple[sqlite3.Row, float, dict[str, float]]] = []
     for row, coarse_score, features in coarse_ranked[:coarse_limit]:
         ml_features = _model_feature_values(row, features)
         ml_score = _predict_rank_model(conn, ml_features)
+        final_score = (
+            ml_score
+            * (0.25 + 0.75 * float(features.get("freshness", 0.0)))
+            * (0.25 + 0.75 * float(features.get("novelty", 1.0)))
+            * (0.25 + 0.75 * float(features.get("information_density", 0.0)))
+            * float(features.get("exposure_decay", 1.0))
+            * float(features.get("frontier", 1.0))
+        )
         merged = dict(features)
         merged["coarse_score"] = coarse_score
         merged["ml_score"] = ml_score
-        refined.append((row, ml_score, merged))
+        refined.append((row, final_score, merged))
     refined.sort(
         key=lambda item: (
             item[1],
@@ -1844,16 +1855,6 @@ def _record_rank_impressions(
             """,
             (event_id, served_at, position, score, json.dumps(features, ensure_ascii=False)),
         )
-        conn.execute(
-            """
-            UPDATE items
-            SET served_count = coalesce(served_count, 0) + 1,
-                last_served_at = ?,
-                rank_score = ?
-            WHERE event_id = ?
-            """,
-            (served_at, score, event_id),
-        )
 
 
 def poll_feeds_only() -> None:
@@ -1892,8 +1893,8 @@ def get_proactive_events() -> list[dict[str, Any]]:
         # 纯 DB 查询，不触发轮询。轮询由 proactive loop 通过 poll_feeds 工具独立驱动。
         _cleanup(conn, cfg)
         now = _now()
-        published_after = (now - timedelta(hours=cfg.proactive_published_within_hours)).isoformat()
-        served_before = (now - timedelta(hours=cfg.rank_resurface_after_hours)).isoformat()
+        published_after = (now - timedelta(hours=cfg.item_retention_hours)).isoformat()
+        candidate_limit = max(1000, cfg.max_content_events * 20)
         rows = conn.execute(
             """
             SELECT
@@ -1906,19 +1907,16 @@ def get_proactive_events() -> list[dict[str, Any]]:
                 i.url,
                 i.author,
                 i.published_at,
-                i.first_seen_at,
-                i.served_count,
-                i.last_served_at
+                i.first_seen_at
             FROM items i
             LEFT JOIN acked_items a ON a.event_id = i.event_id
             WHERE a.event_id IS NULL
               AND (i.published_at IS NOT NULL OR i.source_type != 'rss')
               AND coalesce(i.published_at, i.first_seen_at) >= ?
-              AND (i.last_served_at IS NULL OR i.last_served_at < ?)
             ORDER BY coalesce(i.published_at, i.first_seen_at) DESC
-            LIMIT 200
+            LIMIT ?
             """,
-            (published_after, served_before),
+            (published_after, candidate_limit),
         ).fetchall()
         ranked = _rank_rows(conn, cfg, list(rows), now)
         ranked_by_id = {str(row["event_id"]): (score, features) for row, score, features in ranked}
@@ -1978,7 +1976,7 @@ def acknowledge_events(
     acked: list[str] = []
     failed: list[str] = []
     try:
-        effective_ttl = ttl_hours if ttl_hours is not None else cfg.content_ack_ttl_hours
+        effective_ttl = ttl_hours if ttl_hours is not None else cfg.item_retention_hours
         interest_ok = _interest_ok_from_feedback(feedback)
         _cleanup(conn, cfg)
         for event_id in event_ids:
@@ -2009,8 +2007,7 @@ def acknowledge_events(
                     """
                     SELECT
                         event_id, source_id, source_name, author, title, content, published_at,
-                        first_seen_at, served_count, last_served_at, interest_ok,
-                        interest_scored_at
+                        first_seen_at, interest_ok, interest_scored_at
                     FROM items
                     WHERE event_id = ?
                     """,

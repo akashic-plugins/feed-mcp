@@ -32,29 +32,25 @@ def _published_at_from_status_id(status_id: str) -> str | None:
 
 def _merge_event(conn: sqlite3.Connection, old_event_id: str, new_event_id: str, published_at: str) -> None:
     target = conn.execute(
-        "SELECT interest_ok, served_count, last_served_at FROM items WHERE event_id = ?",
+        "SELECT interest_ok FROM items WHERE event_id = ?",
         (new_event_id,),
     ).fetchone()
     source = conn.execute(
-        "SELECT interest_ok, served_count, last_served_at FROM items WHERE event_id = ?",
+        "SELECT interest_ok FROM items WHERE event_id = ?",
         (old_event_id,),
     ).fetchone()
     if target is None or source is None:
         return
 
     interest_ok = target["interest_ok"] if target["interest_ok"] is not None else source["interest_ok"]
-    served_count = max(int(target["served_count"] or 0), int(source["served_count"] or 0))
-    last_served_at = max(str(target["last_served_at"] or ""), str(source["last_served_at"] or "")) or None
     conn.execute(
         """
         UPDATE items
         SET published_at = ?,
-            interest_ok = ?,
-            served_count = ?,
-            last_served_at = ?
+            interest_ok = ?
         WHERE event_id = ?
         """,
-        (published_at, interest_ok, served_count, last_served_at, new_event_id),
+        (published_at, interest_ok, new_event_id),
     )
     conn.execute(
         """
