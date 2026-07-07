@@ -140,6 +140,10 @@ def _connect(cfg: FeedMcpConfig) -> sqlite3.Connection:
     }
     if "author" not in columns:
         conn.execute("ALTER TABLE items ADD COLUMN author TEXT")
+    if "interest_ok" not in columns:
+        conn.execute("ALTER TABLE items ADD COLUMN interest_ok INTEGER")
+    if "interest_scored_at" not in columns:
+        conn.execute("ALTER TABLE items ADD COLUMN interest_scored_at TEXT")
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS metadata (
@@ -1328,7 +1332,19 @@ def get_proactive_events() -> list[dict[str, Any]]:
         conn.close()
 
 
-def acknowledge_events(event_ids: list[str], ttl_hours: int | None = None) -> dict[str, list[str]]:
+def _interest_ok_from_feedback(feedback: str) -> int:
+    if feedback == "interesting":
+        return 1
+    if feedback == "not_interesting":
+        return 0
+    raise ValueError(f"invalid feedback: {feedback}")
+
+
+def acknowledge_events(
+    event_ids: list[str],
+    feedback: str,
+    ttl_hours: int | None = None,
+) -> dict[str, list[str]]:
     cfg = load_config()
     conn = _connect(cfg)
     now = _now()
@@ -1336,6 +1352,7 @@ def acknowledge_events(event_ids: list[str], ttl_hours: int | None = None) -> di
     failed: list[str] = []
     try:
         effective_ttl = ttl_hours if ttl_hours is not None else cfg.content_ack_ttl_hours
+        interest_ok = _interest_ok_from_feedback(feedback)
         _cleanup(conn, cfg)
         for event_id in event_ids:
             try:
@@ -1352,6 +1369,14 @@ def acknowledge_events(event_ids: list[str], ttl_hours: int | None = None) -> di
                         now.isoformat(),
                         (now + timedelta(hours=effective_ttl)).isoformat(),
                     ),
+                )
+                conn.execute(
+                    """
+                    UPDATE items
+                    SET interest_ok = ?, interest_scored_at = ?
+                    WHERE event_id = ?
+                    """,
+                    (interest_ok, now.isoformat(), event_id),
                 )
                 acked.append(event_id)
             except Exception:
