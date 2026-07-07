@@ -1321,6 +1321,7 @@ _RANK_BIAS = -0.8
 _FRESHNESS_HALF_LIFE_HOURS = 36.0
 _EXPOSURE_RECENCY_HALF_LIFE_HOURS = 12.0
 _RECENT_CONTEXT_LIMIT = 100
+_MAX_SHORTLIST_SOURCE_SHARE = 0.4
 
 
 def _tokenize_rank_text(*parts: object) -> list[str]:
@@ -1749,13 +1750,71 @@ def _update_rank_model_for_row(
         exposure_count,
         last_exposed_at,
     )
+    source_pos, source_neg = _rank_stats(conn, [f"source:{row['source_id']}"]).get(
+        f"source:{row['source_id']}",
+        (0, 0),
+    )
+    source_weight = 1.0 / math.sqrt(1.0 + (source_pos + source_neg) / 20.0)
     _update_rank_model_weights(
         conn,
         _model_feature_values(row, coarse_features),
         interest_ok,
-        cfg.rank_model_learning_rate,
+        cfg.rank_model_learning_rate * source_weight,
         updated_at,
         str(row["event_id"]),
+    )
+
+
+def _source_balanced_shortlist(
+    ranked: list[tuple[sqlite3.Row, float, dict[str, float]]],
+    limit: int,
+) -> list[tuple[sqlite3.Row, float, dict[str, float]]]:
+    if len(ranked) <= limit:
+        return ranked
+    by_source: dict[str, list[tuple[sqlite3.Row, float, dict[str, float]]]] = {}
+    for item in ranked:
+        row = item[0]
+        source_key = str(row["source_id"] or row["source_name"] or "")
+        by_source.setdefault(source_key, []).append(item)
+    per_source = max(4, math.ceil(limit * _MAX_SHORTLIST_SOURCE_SHARE))
+    picked_ids: set[str] = set()
+    shortlist: list[tuple[sqlite3.Row, float, dict[str, float]]] = []
+    for items in by_source.values():
+        for item in items[:per_source]:
+            event_id = str(item[0]["event_id"])
+            if event_id in picked_ids:
+                continue
+            picked_ids.add(event_id)
+            shortlist.append(item)
+    shortlist.sort(
+        key=lambda item: (
+            item[1],
+            str(item[0]["published_at"] or item[0]["first_seen_at"] or ""),
+        ),
+        reverse=True,
+    )
+    for item in ranked:
+        if len(shortlist) >= limit:
+            break
+        event_id = str(item[0]["event_id"])
+        if event_id in picked_ids:
+            continue
+        picked_ids.add(event_id)
+        shortlist.append(item)
+    return shortlist[:limit]
+
+
+def _information_gain_score(ml_score: float, features: dict[str, float]) -> float:
+    freshness = float(features.get("freshness", 0.0))
+    novelty = float(features.get("novelty", 1.0))
+    uncertainty = ml_score * (1.0 - ml_score)
+    useful_learning = uncertainty * freshness * novelty
+    stale_redundancy = (1.0 - freshness) * (1.0 - novelty)
+    return (
+        ml_score
+        * (0.82 + 0.18 * freshness)
+        + 0.04 * useful_learning
+        - 0.04 * ml_score * stale_redundancy
     )
 
 
@@ -1792,14 +1851,18 @@ def _rank_rows(
         reverse=True,
     )
     coarse_limit = max(cfg.max_content_events, cfg.rank_impression_limit * 10)
+    shortlist = _source_balanced_shortlist(coarse_ranked, coarse_limit)
     refined: list[tuple[sqlite3.Row, float, dict[str, float]]] = []
-    for row, coarse_score, features in coarse_ranked[:coarse_limit]:
+    for row, coarse_score, features in shortlist:
         ml_features = _model_feature_values(row, features)
         ml_score = _predict_rank_model(conn, ml_features)
         merged = dict(features)
         merged["coarse_score"] = coarse_score
         merged["ml_score"] = ml_score
-        refined.append((row, ml_score, merged))
+        final_score = _information_gain_score(ml_score, merged)
+        merged["uncertainty"] = ml_score * (1.0 - ml_score)
+        merged["information_gain_score"] = final_score
+        refined.append((row, final_score, merged))
     refined.sort(
         key=lambda item: (
             item[1],
@@ -1960,7 +2023,6 @@ def _interest_ok_from_feedback(feedback: str) -> int:
 def acknowledge_events(
     event_ids: list[str],
     feedback: str,
-    ttl_hours: int | None = None,
 ) -> dict[str, list[str]]:
     cfg = load_config()
     conn = _connect(cfg)
@@ -1968,7 +2030,6 @@ def acknowledge_events(
     acked: list[str] = []
     failed: list[str] = []
     try:
-        effective_ttl = ttl_hours if ttl_hours is not None else cfg.item_retention_hours
         interest_ok = _interest_ok_from_feedback(feedback)
         _cleanup(conn, cfg)
         for event_id in event_ids:
@@ -1984,7 +2045,7 @@ def acknowledge_events(
                     (
                         event_id,
                         now.isoformat(),
-                        (now + timedelta(hours=effective_ttl)).isoformat(),
+                        (now + timedelta(hours=cfg.item_retention_hours)).isoformat(),
                     ),
                 )
                 conn.execute(

@@ -70,10 +70,9 @@ def create_mcp_server() -> FastMCP:
         return json.dumps(feed_backend.get_proactive_events(), ensure_ascii=False)
 
     @mcp.tool()
-    def acknowledge_events(event_ids: List[str], feedback: str, ttl_hours: int = 0) -> str:
-        actual_ttl = ttl_hours if ttl_hours > 0 else None
+    def acknowledge_events(event_ids: List[str], feedback: str) -> str:
         return json.dumps(
-            feed_backend.acknowledge_events(event_ids, feedback=feedback, ttl_hours=actual_ttl),
+            feed_backend.acknowledge_events(event_ids, feedback=feedback),
             ensure_ascii=False,
         )
 
