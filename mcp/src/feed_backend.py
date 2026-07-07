@@ -48,6 +48,7 @@ _DEFAULT_CONFIG = {
     "rank_impression_limit": 5,
     "rank_coarse_limit": 50,
     "rank_model_learning_rate": 0.08,
+    "rank_resurface_after_hours": 12,
     "rank_freshness_half_life_hours": 36,
     "rank_novelty_context_hours": 72,
 }
@@ -67,6 +68,7 @@ class FeedMcpConfig:
     rank_impression_limit: int
     rank_coarse_limit: int
     rank_model_learning_rate: float
+    rank_resurface_after_hours: int
     rank_freshness_half_life_hours: int
     rank_novelty_context_hours: int
 
@@ -110,6 +112,7 @@ def load_config() -> FeedMcpConfig:
         rank_impression_limit=max(1, int(raw.get("rank_impression_limit", 5))),
         rank_coarse_limit=max(1, int(raw.get("rank_coarse_limit", 50))),
         rank_model_learning_rate=max(0.001, float(raw.get("rank_model_learning_rate", 0.08))),
+        rank_resurface_after_hours=max(1, int(raw.get("rank_resurface_after_hours", 12))),
         rank_freshness_half_life_hours=max(1, int(raw.get("rank_freshness_half_life_hours", 36))),
         rank_novelty_context_hours=max(1, int(raw.get("rank_novelty_context_hours", 72))),
     )
@@ -1874,6 +1877,7 @@ def get_proactive_events() -> list[dict[str, Any]]:
         _cleanup(conn, cfg)
         now = _now()
         published_after = (now - timedelta(hours=cfg.proactive_published_within_hours)).isoformat()
+        served_before = (now - timedelta(hours=cfg.rank_resurface_after_hours)).isoformat()
         rows = conn.execute(
             """
             SELECT
@@ -1893,10 +1897,11 @@ def get_proactive_events() -> list[dict[str, Any]]:
             LEFT JOIN acked_items a ON a.event_id = i.event_id
             WHERE a.event_id IS NULL
               AND coalesce(i.published_at, i.first_seen_at) >= ?
+              AND (i.last_served_at IS NULL OR i.last_served_at < ?)
             ORDER BY coalesce(i.published_at, i.first_seen_at) DESC
             LIMIT 200
             """,
-            (published_after,),
+            (published_after, served_before),
         ).fetchall()
         ranked = _rank_rows(conn, cfg, list(rows), now)
         ranked_by_id = {str(row["event_id"]): (score, features) for row, score, features in ranked}
