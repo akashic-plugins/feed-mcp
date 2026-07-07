@@ -1469,11 +1469,47 @@ def _jaccard(left: set[str], right: set[str]) -> float:
     return len(left & right) / len(left | right)
 
 
+def _frontier_overlap(left: set[str], right: set[str]) -> float:
+    if not left or not right:
+        return 0.0
+    intersection = len(left & right)
+    return max(intersection / len(left | right), intersection / min(len(left), len(right)))
+
+
 def _novelty_score(tokens: set[str], contexts: list[set[str]]) -> float:
     if not tokens or not contexts:
         return 1.0
     max_overlap = max((_jaccard(tokens, ctx) for ctx in contexts), default=0.0)
     return max(0.05, 1.0 - max_overlap)
+
+
+def _row_rank_tokens(row: sqlite3.Row) -> set[str]:
+    return set(_tokenize_rank_text(row["source_name"], row["title"], row["content"]))
+
+
+def _row_rank_time(row: sqlite3.Row, now: datetime) -> datetime:
+    return _parse_dt(row["published_at"]) or _parse_dt(row["first_seen_at"]) or now
+
+
+def _frontier_scores(rows: list[sqlite3.Row], now: datetime) -> dict[str, float]:
+    tokens_by_id = {str(row["event_id"]): _row_rank_tokens(row) for row in rows}
+    time_by_id = {str(row["event_id"]): _row_rank_time(row, now) for row in rows}
+    scores: dict[str, float] = {}
+    for row in rows:
+        event_id = str(row["event_id"])
+        tokens = tokens_by_id[event_id]
+        max_newer_overlap = 0.0
+        for other in rows:
+            other_id = str(other["event_id"])
+            if other_id == event_id:
+                continue
+            if other["source_id"] != row["source_id"]:
+                continue
+            if time_by_id[other_id] <= time_by_id[event_id]:
+                continue
+            max_newer_overlap = max(max_newer_overlap, _frontier_overlap(tokens, tokens_by_id[other_id]))
+        scores[event_id] = 1.0 if max_newer_overlap < 0.13 else max(0.08, 1.0 - 3.0 * max_newer_overlap)
+    return scores
 
 
 def _rank_candidate(
@@ -1482,8 +1518,9 @@ def _rank_candidate(
     row: sqlite3.Row,
     contexts: list[set[str]],
     now: datetime,
+    frontier: float,
 ) -> tuple[float, dict[str, float]]:
-    tokens = set(_tokenize_rank_text(row["source_name"], row["title"], row["content"]))
+    tokens = _row_rank_tokens(row)
     information_density = min(1.0, len(tokens) / 16.0)
     keys = _rank_stat_keys(row)
     stats = _rank_stats(conn, keys)
@@ -1501,7 +1538,7 @@ def _rank_candidate(
     freshness, age_hours = _freshness_score(row, cfg, now)
     novelty = _novelty_score(tokens, contexts)
     served_count = int(row["served_count"] or 0)
-    fatigue = 1.0 / (1.0 + 0.35 * served_count)
+    fatigue = 1.0 / (1.0 + served_count)
     z = (
         _RANK_BIAS
         + 2.2 * (source_prior - 0.5)
@@ -1516,6 +1553,7 @@ def _rank_candidate(
         * (0.25 + 0.75 * novelty)
         * (0.25 + 0.75 * information_density)
         * fatigue
+        * frontier
     )
     features = {
         "interest": interest,
@@ -1523,6 +1561,7 @@ def _rank_candidate(
         "age_hours": age_hours,
         "novelty": novelty,
         "fatigue": fatigue,
+        "frontier": frontier,
         "source_prior": source_prior,
         "author_prior": author_prior,
         "token_log_odds": avg_token_log_odds,
@@ -1539,8 +1578,19 @@ def _rank_rows(
     now: datetime,
 ) -> list[tuple[sqlite3.Row, float, dict[str, float]]]:
     contexts = _recent_context_tokens(conn, cfg, now)
+    frontier_by_id = _frontier_scores(rows, now)
     ranked = [
-        (row, *_rank_candidate(conn, cfg, row, contexts, now))
+        (
+            row,
+            *_rank_candidate(
+                conn,
+                cfg,
+                row,
+                contexts,
+                now,
+                frontier_by_id.get(str(row["event_id"]), 1.0),
+            ),
+        )
         for row in rows
     ]
     ranked.sort(
