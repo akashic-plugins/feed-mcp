@@ -46,6 +46,8 @@ _DEFAULT_CONFIG = {
     "max_content_events": 50,
     "rank_mode": "shadow",
     "rank_impression_limit": 5,
+    "rank_coarse_limit": 50,
+    "rank_model_learning_rate": 0.08,
     "rank_freshness_half_life_hours": 36,
     "rank_novelty_context_hours": 72,
 }
@@ -63,6 +65,8 @@ class FeedMcpConfig:
     max_content_events: int
     rank_mode: str
     rank_impression_limit: int
+    rank_coarse_limit: int
+    rank_model_learning_rate: float
     rank_freshness_half_life_hours: int
     rank_novelty_context_hours: int
 
@@ -104,6 +108,8 @@ def load_config() -> FeedMcpConfig:
         max_content_events=max(1, int(raw["max_content_events"])),
         rank_mode=str(raw.get("rank_mode", "shadow")),
         rank_impression_limit=max(1, int(raw.get("rank_impression_limit", 5))),
+        rank_coarse_limit=max(1, int(raw.get("rank_coarse_limit", 50))),
+        rank_model_learning_rate=max(0.001, float(raw.get("rank_model_learning_rate", 0.08))),
         rank_freshness_half_life_hours=max(1, int(raw.get("rank_freshness_half_life_hours", 36))),
         rank_novelty_context_hours=max(1, int(raw.get("rank_novelty_context_hours", 72))),
     )
@@ -213,7 +219,17 @@ def _connect(cfg: FeedMcpConfig) -> sqlite3.Connection:
         )
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS rank_model_weights (
+            key TEXT PRIMARY KEY,
+            weight REAL NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
     _ensure_rank_stats(conn)
+    _ensure_rank_model(conn, cfg)
     _normalize_existing_source_urls(conn)
     _normalize_existing_item_urls(conn)
     _normalize_existing_xcancel_items(conn)
@@ -1403,6 +1419,66 @@ def _rank_stats(conn: sqlite3.Connection, keys: list[str]) -> dict[str, tuple[in
     return {str(row["key"]): (int(row["pos"]), int(row["neg"])) for row in rows}
 
 
+def _rank_model_weights(conn: sqlite3.Connection, keys: list[str]) -> dict[str, float]:
+    if not keys:
+        return {}
+    placeholders = ",".join("?" for _ in keys)
+    rows = conn.execute(
+        f"SELECT key, weight FROM rank_model_weights WHERE key IN ({placeholders})",
+        keys,
+    ).fetchall()
+    return {str(row["key"]): float(row["weight"]) for row in rows}
+
+
+def _update_rank_model_weights(
+    conn: sqlite3.Connection,
+    features: dict[str, float],
+    label: int,
+    learning_rate: float,
+    updated_at: str,
+) -> None:
+    weights = _rank_model_weights(conn, list(features))
+    prediction = _sigmoid(sum(weights.get(key, 0.0) * value for key, value in features.items()))
+    error = float(label) - prediction
+    for key, value in features.items():
+        old_weight = weights.get(key, 0.0)
+        new_weight = max(-8.0, min(8.0, old_weight + learning_rate * error * value))
+        conn.execute(
+            """
+            INSERT INTO rank_model_weights(key, weight, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET
+                weight = excluded.weight,
+                updated_at = excluded.updated_at
+            """,
+            (key, new_weight, updated_at),
+        )
+
+
+def _ensure_rank_model(conn: sqlite3.Connection, cfg: FeedMcpConfig) -> None:
+    count = conn.execute("SELECT COUNT(*) FROM rank_model_weights").fetchone()[0]
+    if int(count) > 0:
+        return
+    rows = conn.execute(
+        """
+        SELECT
+            source_id, source_name, author, title, content, published_at,
+            first_seen_at, served_count, last_served_at, interest_ok, interest_scored_at
+        FROM items
+        WHERE interest_ok IN (0, 1)
+        ORDER BY coalesce(interest_scored_at, last_served_at, published_at, first_seen_at)
+        """
+    ).fetchall()
+    for row in rows:
+        _update_rank_model_for_row(
+            conn,
+            cfg,
+            row,
+            int(row["interest_ok"]),
+            str(row["interest_scored_at"] or _now().isoformat()),
+        )
+
+
 def _accept_rate(pos: int, neg: int) -> float:
     return (pos + 1.0) / (pos + neg + 2.0)
 
@@ -1571,6 +1647,76 @@ def _rank_candidate(
     return score, features
 
 
+def _age_bucket(age_hours: float) -> str:
+    if age_hours <= 1:
+        return "1h"
+    if age_hours <= 6:
+        return "6h"
+    if age_hours <= 24:
+        return "24h"
+    if age_hours <= 72:
+        return "72h"
+    return "old"
+
+
+def _model_feature_values(
+    row: sqlite3.Row,
+    coarse_features: dict[str, float],
+) -> dict[str, float]:
+    tokens = _tokenize_rank_text(row["source_name"], row["title"], row["content"])
+    token_weight = 1.0 / math.sqrt(max(1, min(len(tokens), 32)))
+    features: dict[str, float] = {
+        "bias": 1.0,
+        f"source:{row['source_id']}": 1.0,
+        f"age:{_age_bucket(float(coarse_features.get('age_hours', 0.0)))}": 1.0,
+        "freshness": float(coarse_features.get("freshness", 0.0)),
+        "novelty": float(coarse_features.get("novelty", 1.0)),
+        "frontier": float(coarse_features.get("frontier", 1.0)),
+        "density": float(coarse_features.get("information_density", 0.0)),
+        "source_prior": float(coarse_features.get("source_prior", 0.5)) - 0.5,
+        "served": min(1.0, float(coarse_features.get("served_count", 0.0)) / 5.0),
+    }
+    author = str(row["author"] or "").strip().lower()
+    if author:
+        features[f"author:{author[:96]}"] = 1.0
+    for token in tokens[:32]:
+        features[f"token:{token}"] = token_weight
+    return features
+
+
+def _predict_rank_model(
+    conn: sqlite3.Connection,
+    features: dict[str, float],
+) -> float:
+    weights = _rank_model_weights(conn, list(features))
+    return _sigmoid(sum(weights.get(key, 0.0) * value for key, value in features.items()))
+
+
+def _update_rank_model_for_row(
+    conn: sqlite3.Connection,
+    cfg: FeedMcpConfig,
+    row: sqlite3.Row,
+    interest_ok: int,
+    updated_at: str,
+) -> None:
+    contexts = _recent_context_tokens(conn, cfg, _now())
+    _coarse_score, coarse_features = _rank_candidate(
+        conn,
+        cfg,
+        row,
+        contexts,
+        _now(),
+        1.0,
+    )
+    _update_rank_model_weights(
+        conn,
+        _model_feature_values(row, coarse_features),
+        interest_ok,
+        cfg.rank_model_learning_rate,
+        updated_at,
+    )
+
+
 def _rank_rows(
     conn: sqlite3.Connection,
     cfg: FeedMcpConfig,
@@ -1579,7 +1725,7 @@ def _rank_rows(
 ) -> list[tuple[sqlite3.Row, float, dict[str, float]]]:
     contexts = _recent_context_tokens(conn, cfg, now)
     frontier_by_id = _frontier_scores(rows, now)
-    ranked = [
+    coarse_ranked = [
         (
             row,
             *_rank_candidate(
@@ -1593,14 +1739,31 @@ def _rank_rows(
         )
         for row in rows
     ]
-    ranked.sort(
+    coarse_ranked.sort(
         key=lambda item: (
             item[1],
             str(item[0]["published_at"] or item[0]["first_seen_at"] or ""),
         ),
         reverse=True,
     )
-    return ranked
+    coarse_limit = max(cfg.max_content_events, cfg.rank_impression_limit, cfg.rank_coarse_limit)
+    refined: list[tuple[sqlite3.Row, float, dict[str, float]]] = []
+    for row, coarse_score, features in coarse_ranked[:coarse_limit]:
+        ml_features = _model_feature_values(row, features)
+        ml_score = _predict_rank_model(conn, ml_features)
+        merged = dict(features)
+        merged["coarse_score"] = coarse_score
+        merged["ml_score"] = ml_score
+        refined.append((row, ml_score, merged))
+    refined.sort(
+        key=lambda item: (
+            item[1],
+            item[2].get("coarse_score", 0.0),
+            str(item[0]["published_at"] or item[0]["first_seen_at"] or ""),
+        ),
+        reverse=True,
+    )
+    return refined
 
 
 def _record_rank_impressions(
@@ -1779,7 +1942,10 @@ def acknowledge_events(
                 )
                 row = conn.execute(
                     """
-                    SELECT source_id, source_name, author, title, content, interest_ok, interest_scored_at
+                    SELECT
+                        source_id, source_name, author, title, content, published_at,
+                        first_seen_at, served_count, last_served_at, interest_ok,
+                        interest_scored_at
                     FROM items
                     WHERE event_id = ?
                     """,
@@ -1787,6 +1953,7 @@ def acknowledge_events(
                 ).fetchone()
                 if row is not None:
                     _update_rank_stats_for_row(conn, row, interest_ok, now.isoformat())
+                    _update_rank_model_for_row(conn, cfg, row, interest_ok, now.isoformat())
                 acked.append(event_id)
             except Exception:
                 logger.exception("feed ack failed: %s", event_id)

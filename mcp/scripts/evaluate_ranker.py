@@ -171,6 +171,8 @@ def evaluate(
             label = labels[str(row["event_id"])] if labels is not None else int(row["interest_ok"])
             print(
                 f"- y={label} score={score:.4f} "
+                f"ml={features.get('ml_score', score):.3f} "
+                f"coarse={features.get('coarse_score', 0.0):.3f} "
                 f"interest={features['interest']:.3f} novelty={features['novelty']:.3f} "
                 f"fresh={features['freshness']:.3f} title={str(row['title'] or '')[:80]}"
             )
