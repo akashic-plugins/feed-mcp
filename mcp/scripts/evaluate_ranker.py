@@ -44,10 +44,12 @@ def _mrr(labels: list[int]) -> float:
 
 
 def _metrics(labels: list[int], k: int) -> dict[str, float]:
+    top = labels[:k]
     return {
         f"precision@{k}": _precision(labels, k),
         f"ndcg@{k}": _ndcg(labels, k),
         "mrr": _mrr(labels),
+        f"utility@{k}": float(sum(1 if label == 1 else -1 for label in top)),
         "accept_rate": sum(labels) / len(labels) if labels else 0.0,
         "count": float(len(labels)),
     }

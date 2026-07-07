@@ -1791,23 +1791,15 @@ def _rank_rows(
         ),
         reverse=True,
     )
-    coarse_limit = max(cfg.max_content_events, cfg.rank_impression_limit, cfg.max_content_events * 10)
+    coarse_limit = max(cfg.max_content_events, cfg.rank_impression_limit * 10)
     refined: list[tuple[sqlite3.Row, float, dict[str, float]]] = []
     for row, coarse_score, features in coarse_ranked[:coarse_limit]:
         ml_features = _model_feature_values(row, features)
         ml_score = _predict_rank_model(conn, ml_features)
-        final_score = (
-            ml_score
-            * (0.25 + 0.75 * float(features.get("freshness", 0.0)))
-            * (0.25 + 0.75 * float(features.get("novelty", 1.0)))
-            * (0.25 + 0.75 * float(features.get("information_density", 0.0)))
-            * float(features.get("exposure_decay", 1.0))
-            * float(features.get("frontier", 1.0))
-        )
         merged = dict(features)
         merged["coarse_score"] = coarse_score
         merged["ml_score"] = ml_score
-        refined.append((row, final_score, merged))
+        refined.append((row, ml_score, merged))
     refined.sort(
         key=lambda item: (
             item[1],

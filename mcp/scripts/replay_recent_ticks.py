@@ -35,8 +35,10 @@ def _metrics(labels: list[int | None], k: int) -> dict[str, float]:
     top = labels[:k]
     known = [label for label in top if label is not None]
     positives = sum(1 for label in top if label == 1)
+    utility = sum(1 if label == 1 else -1 if label == 0 else 0 for label in top)
     return {
         "positive_at_k": float(positives),
+        "utility_at_k": float(utility),
         "accept_rate_at_k": positives / k if k else 0.0,
         "known_accept_rate": positives / len(known) if known else 0.0,
         "known": float(len(known)),
