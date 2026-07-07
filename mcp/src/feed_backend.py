@@ -341,7 +341,11 @@ def _delete_source_history(conn: sqlite3.Connection, source_ids: list[str]) -> t
 
 
 def _stable_event_id(source_id: str, url: str, title: str, published_at: str | None) -> str:
-    raw = "|".join([source_id, _canonical_item_key(url or ""), title or "", published_at or ""])
+    item_key = _canonical_item_key(url or "")
+    if item_key.startswith("xstatus:"):
+        raw = "|".join([source_id, item_key])
+    else:
+        raw = "|".join([source_id, item_key, title or "", published_at or ""])
     return "fmcp_" + hashlib.sha1(raw.encode()).hexdigest()[:16]
 
 
