@@ -1786,7 +1786,27 @@ def _rank_rows(
         ),
         reverse=True,
     )
-    return refined
+    head_limit = min(cfg.rank_impression_limit, len(refined))
+    if head_limit <= 1:
+        return refined
+
+    max_per_source = max(1, head_limit // 2)
+    source_counts: dict[str, int] = {}
+    head: list[tuple[sqlite3.Row, float, dict[str, float]]] = []
+    tail: list[tuple[sqlite3.Row, float, dict[str, float]]] = []
+    for item in refined:
+        row = item[0]
+        source_key = str(row["source_id"] or row["source_name"] or "")
+        if len(head) < head_limit and source_counts.get(source_key, 0) < max_per_source:
+            source_counts[source_key] = source_counts.get(source_key, 0) + 1
+            head.append(item)
+        else:
+            tail.append(item)
+    if len(head) < head_limit:
+        missing = head_limit - len(head)
+        head.extend(tail[:missing])
+        tail = tail[missing:]
+    return head + tail
 
 
 def _record_rank_impressions(
