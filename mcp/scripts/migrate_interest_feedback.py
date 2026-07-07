@@ -96,6 +96,11 @@ def migrate(feed_db: Path, proactive_db: Path) -> tuple[int, int]:
                 (interest_ok, scored_at or fallback_time, event_id),
             )
             updated += cur.rowcount
+        has_rank_stats = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'rank_stats'"
+        ).fetchone()
+        if has_rank_stats is not None:
+            conn.execute("DELETE FROM rank_stats")
         conn.commit()
         return seen, updated
     finally:

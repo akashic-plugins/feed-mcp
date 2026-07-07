@@ -12,6 +12,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import re
 import sqlite3
 import subprocess
@@ -43,6 +44,10 @@ _DEFAULT_CONFIG = {
     "proactive_published_within_hours": 36,
     "max_items_per_source": 100,
     "max_content_events": 50,
+    "rank_mode": "shadow",
+    "rank_impression_limit": 5,
+    "rank_freshness_half_life_hours": 36,
+    "rank_novelty_context_hours": 72,
 }
 
 
@@ -56,6 +61,10 @@ class FeedMcpConfig:
     proactive_published_within_hours: int
     max_items_per_source: int
     max_content_events: int
+    rank_mode: str
+    rank_impression_limit: int
+    rank_freshness_half_life_hours: int
+    rank_novelty_context_hours: int
 
 
 def _config_path() -> Path:
@@ -93,6 +102,10 @@ def load_config() -> FeedMcpConfig:
         proactive_published_within_hours=max(1, int(raw.get("proactive_published_within_hours", 36))),
         max_items_per_source=max(1, int(raw.get("max_items_per_source", 100))),
         max_content_events=max(1, int(raw["max_content_events"])),
+        rank_mode=str(raw.get("rank_mode", "shadow")),
+        rank_impression_limit=max(1, int(raw.get("rank_impression_limit", 5))),
+        rank_freshness_half_life_hours=max(1, int(raw.get("rank_freshness_half_life_hours", 36))),
+        rank_novelty_context_hours=max(1, int(raw.get("rank_novelty_context_hours", 72))),
     )
 
 
@@ -144,6 +157,12 @@ def _connect(cfg: FeedMcpConfig) -> sqlite3.Connection:
         conn.execute("ALTER TABLE items ADD COLUMN interest_ok INTEGER")
     if "interest_scored_at" not in columns:
         conn.execute("ALTER TABLE items ADD COLUMN interest_scored_at TEXT")
+    if "served_count" not in columns:
+        conn.execute("ALTER TABLE items ADD COLUMN served_count INTEGER NOT NULL DEFAULT 0")
+    if "last_served_at" not in columns:
+        conn.execute("ALTER TABLE items ADD COLUMN last_served_at TEXT")
+    if "rank_score" not in columns:
+        conn.execute("ALTER TABLE items ADD COLUMN rank_score REAL")
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS metadata (
@@ -172,6 +191,29 @@ def _connect(cfg: FeedMcpConfig) -> sqlite3.Connection:
         )
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS rank_stats (
+            key TEXT PRIMARY KEY,
+            pos INTEGER NOT NULL DEFAULT 0,
+            neg INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS rank_impressions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_id TEXT NOT NULL,
+            served_at TEXT NOT NULL,
+            position INTEGER NOT NULL,
+            rank_score REAL NOT NULL,
+            features_json TEXT NOT NULL
+        )
+        """
+    )
+    _ensure_rank_stats(conn)
     _normalize_existing_source_urls(conn)
     _normalize_existing_item_urls(conn)
     _normalize_existing_xcancel_items(conn)
@@ -1265,6 +1307,280 @@ def _build_display_text(row: sqlite3.Row) -> str:
     return "\n".join(parts)
 
 
+_TOKEN_RE = re.compile(r"[a-z0-9_+#.-]{2,}|[\u4e00-\u9fff]", re.IGNORECASE)
+_RANK_BIAS = -0.8
+
+
+def _tokenize_rank_text(*parts: object) -> list[str]:
+    text = " ".join(str(part or "") for part in parts).lower()
+    raw_tokens = _TOKEN_RE.findall(text)
+    tokens: list[str] = []
+    cjk_buffer: list[str] = []
+    for token in raw_tokens:
+        if re.fullmatch(r"[\u4e00-\u9fff]", token):
+            cjk_buffer.append(token)
+            continue
+        if len(cjk_buffer) >= 2:
+            tokens.extend("".join(cjk_buffer[i:i + 2]) for i in range(len(cjk_buffer) - 1))
+        cjk_buffer = []
+        if len(token) >= 2:
+            tokens.append(token)
+    if len(cjk_buffer) >= 2:
+        tokens.extend("".join(cjk_buffer[i:i + 2]) for i in range(len(cjk_buffer) - 1))
+    seen: set[str] = set()
+    result: list[str] = []
+    for token in tokens:
+        if token in seen:
+            continue
+        seen.add(token)
+        result.append(token[:64])
+        if len(result) >= 80:
+            break
+    return result
+
+
+def _rank_stat_keys(row: sqlite3.Row) -> list[str]:
+    keys = [f"source:{row['source_id']}"]
+    author = str(row["author"] or "").strip().lower()
+    if author:
+        keys.append(f"author:{author[:96]}")
+    for token in _tokenize_rank_text(row["source_name"], row["title"], row["content"]):
+        keys.append(f"token:{token}")
+    return keys
+
+
+def _ensure_rank_stats(conn: sqlite3.Connection) -> None:
+    count = conn.execute("SELECT COUNT(*) FROM rank_stats").fetchone()[0]
+    if int(count) > 0:
+        return
+    rows = conn.execute(
+        """
+        SELECT source_id, source_name, author, title, content, interest_ok, interest_scored_at
+        FROM items
+        WHERE interest_ok IN (0, 1)
+        """
+    ).fetchall()
+    now = _now().isoformat()
+    for row in rows:
+        _update_rank_stats_for_row(
+            conn,
+            row,
+            int(row["interest_ok"]),
+            str(row["interest_scored_at"] or now),
+        )
+
+
+def _update_rank_stats_for_row(
+    conn: sqlite3.Connection,
+    row: sqlite3.Row,
+    interest_ok: int,
+    updated_at: str,
+) -> None:
+    pos_inc = 1 if interest_ok == 1 else 0
+    neg_inc = 1 if interest_ok == 0 else 0
+    for key in _rank_stat_keys(row):
+        conn.execute(
+            """
+            INSERT INTO rank_stats(key, pos, neg, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET
+                pos = pos + excluded.pos,
+                neg = neg + excluded.neg,
+                updated_at = excluded.updated_at
+            """,
+            (key, pos_inc, neg_inc, updated_at),
+        )
+
+
+def _rank_stats(conn: sqlite3.Connection, keys: list[str]) -> dict[str, tuple[int, int]]:
+    if not keys:
+        return {}
+    placeholders = ",".join("?" for _ in keys)
+    rows = conn.execute(
+        f"SELECT key, pos, neg FROM rank_stats WHERE key IN ({placeholders})",
+        keys,
+    ).fetchall()
+    return {str(row["key"]): (int(row["pos"]), int(row["neg"])) for row in rows}
+
+
+def _accept_rate(pos: int, neg: int) -> float:
+    return (pos + 1.0) / (pos + neg + 2.0)
+
+
+def _sigmoid(value: float) -> float:
+    if value < -40:
+        return 0.0
+    if value > 40:
+        return 1.0
+    return 1.0 / (1.0 + math.exp(-value))
+
+
+def _parse_dt(value: object) -> datetime | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
+def _freshness_score(row: sqlite3.Row, cfg: FeedMcpConfig, now: datetime) -> tuple[float, float]:
+    ts = _parse_dt(row["published_at"]) or _parse_dt(row["first_seen_at"]) or now
+    age_hours = max(0.0, (now - ts).total_seconds() / 3600.0)
+    return math.exp(-age_hours / cfg.rank_freshness_half_life_hours), age_hours
+
+
+def _recent_context_tokens(
+    conn: sqlite3.Connection,
+    cfg: FeedMcpConfig,
+    now: datetime,
+) -> list[set[str]]:
+    cutoff = (now - timedelta(hours=cfg.rank_novelty_context_hours)).isoformat()
+    rows = conn.execute(
+        """
+        SELECT i.source_name, i.title, i.content
+        FROM items i
+        WHERE i.interest_ok = 1
+           OR i.event_id IN (
+                SELECT event_id
+                FROM rank_impressions
+                WHERE served_at >= ?
+                ORDER BY served_at DESC
+                LIMIT 200
+           )
+        ORDER BY coalesce(i.interest_scored_at, i.last_served_at, i.published_at, i.first_seen_at) DESC
+        LIMIT 200
+        """,
+        (cutoff,),
+    ).fetchall()
+    return [
+        set(_tokenize_rank_text(row["source_name"], row["title"], row["content"]))
+        for row in rows
+    ]
+
+
+def _jaccard(left: set[str], right: set[str]) -> float:
+    if not left or not right:
+        return 0.0
+    return len(left & right) / len(left | right)
+
+
+def _novelty_score(tokens: set[str], contexts: list[set[str]]) -> float:
+    if not tokens or not contexts:
+        return 1.0
+    max_overlap = max((_jaccard(tokens, ctx) for ctx in contexts), default=0.0)
+    return max(0.05, 1.0 - max_overlap)
+
+
+def _rank_candidate(
+    conn: sqlite3.Connection,
+    cfg: FeedMcpConfig,
+    row: sqlite3.Row,
+    contexts: list[set[str]],
+    now: datetime,
+) -> tuple[float, dict[str, float]]:
+    tokens = set(_tokenize_rank_text(row["source_name"], row["title"], row["content"]))
+    information_density = min(1.0, len(tokens) / 16.0)
+    keys = _rank_stat_keys(row)
+    stats = _rank_stats(conn, keys)
+    source_pos, source_neg = stats.get(f"source:{row['source_id']}", (0, 0))
+    author = str(row["author"] or "").strip().lower()
+    author_pos, author_neg = stats.get(f"author:{author[:96]}", (0, 0)) if author else (0, 0)
+    token_values: list[float] = []
+    for token in tokens:
+        pos, neg = stats.get(f"token:{token}", (0, 0))
+        if pos or neg:
+            token_values.append(math.log((pos + 1.0) / (neg + 1.0)))
+    avg_token_log_odds = sum(token_values) / len(token_values) if token_values else 0.0
+    source_prior = _accept_rate(source_pos, source_neg)
+    author_prior = _accept_rate(author_pos, author_neg) if author else 0.5
+    freshness, age_hours = _freshness_score(row, cfg, now)
+    novelty = _novelty_score(tokens, contexts)
+    served_count = int(row["served_count"] or 0)
+    fatigue = 1.0 / (1.0 + 0.35 * served_count)
+    z = (
+        _RANK_BIAS
+        + 2.2 * (source_prior - 0.5)
+        + 1.4 * (author_prior - 0.5)
+        + 0.8 * avg_token_log_odds
+        + 0.6 * freshness
+    )
+    interest = _sigmoid(z)
+    score = (
+        interest
+        * (0.25 + 0.75 * freshness)
+        * (0.25 + 0.75 * novelty)
+        * (0.25 + 0.75 * information_density)
+        * fatigue
+    )
+    features = {
+        "interest": interest,
+        "freshness": freshness,
+        "age_hours": age_hours,
+        "novelty": novelty,
+        "fatigue": fatigue,
+        "source_prior": source_prior,
+        "author_prior": author_prior,
+        "token_log_odds": avg_token_log_odds,
+        "served_count": float(served_count),
+        "information_density": information_density,
+    }
+    return score, features
+
+
+def _rank_rows(
+    conn: sqlite3.Connection,
+    cfg: FeedMcpConfig,
+    rows: list[sqlite3.Row],
+    now: datetime,
+) -> list[tuple[sqlite3.Row, float, dict[str, float]]]:
+    contexts = _recent_context_tokens(conn, cfg, now)
+    ranked = [
+        (row, *_rank_candidate(conn, cfg, row, contexts, now))
+        for row in rows
+    ]
+    ranked.sort(
+        key=lambda item: (
+            item[1],
+            str(item[0]["published_at"] or item[0]["first_seen_at"] or ""),
+        ),
+        reverse=True,
+    )
+    return ranked
+
+
+def _record_rank_impressions(
+    conn: sqlite3.Connection,
+    ranked: list[tuple[sqlite3.Row, float, dict[str, float]]],
+    now: datetime,
+    limit: int,
+) -> None:
+    served_at = now.isoformat()
+    for position, (row, score, features) in enumerate(ranked[:limit], start=1):
+        event_id = str(row["event_id"])
+        conn.execute(
+            """
+            INSERT INTO rank_impressions(event_id, served_at, position, rank_score, features_json)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (event_id, served_at, position, score, json.dumps(features, ensure_ascii=False)),
+        )
+        conn.execute(
+            """
+            UPDATE items
+            SET served_count = coalesce(served_count, 0) + 1,
+                last_served_at = ?,
+                rank_score = ?
+            WHERE event_id = ?
+            """,
+            (served_at, score, event_id),
+        )
+
+
 def poll_feeds_only() -> None:
     """按需轮询所有启用源（尊重 poll_ttl_seconds），不返回内容。
     由 proactive loop 按固定周期调用，与 get_proactive_events 完全解耦。
@@ -1300,20 +1616,52 @@ def get_proactive_events() -> list[dict[str, Any]]:
     try:
         # 纯 DB 查询，不触发轮询。轮询由 proactive loop 通过 poll_feeds 工具独立驱动。
         _cleanup(conn, cfg)
-        published_after = (_now() - timedelta(hours=cfg.proactive_published_within_hours)).isoformat()
-        # 2. 只返回"未 ack"的候选，时间窗口内的所有条目，去重由 agent 侧负责。
+        now = _now()
+        published_after = (now - timedelta(hours=cfg.proactive_published_within_hours)).isoformat()
         rows = conn.execute(
             """
-            SELECT i.event_id, i.source_type, i.source_name, i.title, i.content, i.url, i.published_at
+            SELECT
+                i.event_id,
+                i.source_id,
+                i.source_type,
+                i.source_name,
+                i.title,
+                i.content,
+                i.url,
+                i.author,
+                i.published_at,
+                i.first_seen_at,
+                i.served_count,
+                i.last_served_at
             FROM items i
             LEFT JOIN acked_items a ON a.event_id = i.event_id
             WHERE a.event_id IS NULL
               AND coalesce(i.published_at, i.first_seen_at) >= ?
             ORDER BY coalesce(i.published_at, i.first_seen_at) DESC
-            LIMIT ?
+            LIMIT 200
             """,
-            (published_after, cfg.max_content_events),
+            (published_after,),
         ).fetchall()
+        ranked = _rank_rows(conn, cfg, list(rows), now)
+        ranked_by_id = {str(row["event_id"]): (score, features) for row, score, features in ranked}
+        if cfg.rank_mode == "ranked":
+            selected = ranked[:cfg.max_content_events]
+        else:
+            selected = [
+                (
+                    row,
+                    ranked_by_id.get(str(row["event_id"]), (0.0, {}))[0],
+                    ranked_by_id.get(str(row["event_id"]), (0.0, {}))[1],
+                )
+                for row in rows[:cfg.max_content_events]
+            ]
+        _record_rank_impressions(
+            conn,
+            selected,
+            now,
+            min(cfg.rank_impression_limit, cfg.max_content_events),
+        )
+        conn.commit()
         return [
             {
                 "event_id": row["event_id"],
@@ -1325,8 +1673,9 @@ def get_proactive_events() -> list[dict[str, Any]]:
                 "url": row["url"],
                 "published_at": row["published_at"],
                 "display_text": _build_display_text(row),
+                "rank_score": round(score, 6),
             }
-            for row in rows
+            for row, score, _features in selected
         ]
     finally:
         conn.close()
@@ -1378,6 +1727,16 @@ def acknowledge_events(
                     """,
                     (interest_ok, now.isoformat(), event_id),
                 )
+                row = conn.execute(
+                    """
+                    SELECT source_id, source_name, author, title, content, interest_ok, interest_scored_at
+                    FROM items
+                    WHERE event_id = ?
+                    """,
+                    (event_id,),
+                ).fetchone()
+                if row is not None:
+                    _update_rank_stats_for_row(conn, row, interest_ok, now.isoformat())
                 acked.append(event_id)
             except Exception:
                 logger.exception("feed ack failed: %s", event_id)

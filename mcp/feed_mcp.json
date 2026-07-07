@@ -7,5 +7,9 @@
   "general_item_retention_hours": 168,
   "proactive_published_within_hours": 36,
   "max_items_per_source": 100,
-  "max_content_events": 50
+  "max_content_events": 50,
+  "rank_mode": "shadow",
+  "rank_impression_limit": 5,
+  "rank_freshness_half_life_hours": 36,
+  "rank_novelty_context_hours": 72
 }
