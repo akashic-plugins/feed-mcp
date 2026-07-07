@@ -2,6 +2,7 @@
 import logging
 import os
 import sys
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 
@@ -21,7 +22,12 @@ def _setup_logging(runtime_dir: Path) -> None:
     formatter = logging.Formatter(
         "%(asctime)s %(levelname)-8s %(name)s | %(message)s"
     )
-    file_handler = logging.FileHandler(runtime_log, encoding="utf-8")
+    file_handler = RotatingFileHandler(
+        runtime_log,
+        maxBytes=5 * 1024 * 1024,
+        backupCount=3,
+        encoding="utf-8",
+    )
     file_handler.setLevel(logging.INFO)
     file_handler.setFormatter(formatter)
 

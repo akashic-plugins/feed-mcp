@@ -42,7 +42,10 @@ feed-mcp
       ├─ feed_mcp.sqlite3
       ├─ source_scores.json
       ├─ feed_cache.db
-      └─ feed_mcp.runtime.log
+      ├─ feed_mcp.runtime.log
+      ├─ feed_mcp.runtime.log.1
+      ├─ feed_mcp.runtime.log.2
+      └─ feed_mcp.runtime.log.3
 ```
 
 边界约定：
@@ -50,6 +53,7 @@ feed-mcp
 - `cache` 只放代码包与依赖环境，可被新版本替换
 - `data` 只放运行时状态与历史数据，升级时保留
 - 仓库本身不提交 sqlite、日志、运行态缓存
+- 运行日志按 5MB 轮转，最多保留 3 个历史文件
 
 当前 feed 的持久化方式：
 
