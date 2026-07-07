@@ -540,6 +540,18 @@ def _strip(text: str | None) -> str:
     return (text or "").strip()
 
 
+def _xml_local_name(tag: str) -> str:
+    return tag.rsplit("}", 1)[-1]
+
+
+def _find_child_text(el: ET.Element, *names: str) -> str:
+    wanted = {name.lower() for name in names}
+    for child in el:
+        if _xml_local_name(child.tag).lower() in wanted:
+            return _strip(child.text)
+    return ""
+
+
 def _parse_rss(xml_text: str) -> list[dict[str, str | None]]:
     xml_text = _normalize_xml_text(xml_text)
     if _is_xcancel_whitelist_feed(xml_text):
@@ -578,13 +590,13 @@ def _parse_rss(xml_text: str) -> list[dict[str, str | None]]:
     for item in root.findall(".//item"):
         items.append(
             {
-                "title": _strip(item.findtext("title")),
+                "title": _find_child_text(item, "title"),
                 "content": _strip_html(
-                    _strip(item.findtext("description")) or _strip(item.findtext("content:encoded"))
+                    _find_child_text(item, "description") or _find_child_text(item, "encoded")
                 )[:_MAX_CONTENT],
-                "url": _strip(item.findtext("link")) or None,
-                "author": _strip(item.findtext("author")) or _strip(item.findtext("dc:creator")) or None,
-                "published_at": _parse_dt(_strip(item.findtext("pubDate"))),
+                "url": _find_child_text(item, "link") or None,
+                "author": _find_child_text(item, "author", "creator") or None,
+                "published_at": _parse_dt(_find_child_text(item, "pubDate", "date", "published", "updated")),
             }
         )
     return items
@@ -1516,7 +1528,7 @@ def _sigmoid(value: float) -> float:
     return 1.0 / (1.0 + math.exp(-value))
 
 
-def _parse_dt(value: object) -> datetime | None:
+def _parse_rank_dt(value: object) -> datetime | None:
     raw = str(value or "").strip()
     if not raw:
         return None
@@ -1530,7 +1542,7 @@ def _parse_dt(value: object) -> datetime | None:
 
 
 def _freshness_score(row: sqlite3.Row, cfg: FeedMcpConfig, now: datetime) -> tuple[float, float]:
-    ts = _parse_dt(row["published_at"]) or _parse_dt(row["first_seen_at"]) or now
+    ts = _parse_rank_dt(row["published_at"]) or _parse_rank_dt(row["first_seen_at"]) or now
     age_hours = max(0.0, (now - ts).total_seconds() / 3600.0)
     return math.exp(-age_hours / cfg.rank_freshness_half_life_hours), age_hours
 
@@ -1589,7 +1601,7 @@ def _row_rank_tokens(row: sqlite3.Row) -> set[str]:
 
 
 def _row_rank_time(row: sqlite3.Row, now: datetime) -> datetime:
-    return _parse_dt(row["published_at"]) or _parse_dt(row["first_seen_at"]) or now
+    return _parse_rank_dt(row["published_at"]) or _parse_rank_dt(row["first_seen_at"]) or now
 
 
 def _frontier_scores(rows: list[sqlite3.Row], now: datetime) -> dict[str, float]:
@@ -1896,6 +1908,7 @@ def get_proactive_events() -> list[dict[str, Any]]:
             FROM items i
             LEFT JOIN acked_items a ON a.event_id = i.event_id
             WHERE a.event_id IS NULL
+              AND (i.published_at IS NOT NULL OR i.source_type != 'rss')
               AND coalesce(i.published_at, i.first_seen_at) >= ?
               AND (i.last_served_at IS NULL OR i.last_served_at < ?)
             ORDER BY coalesce(i.published_at, i.first_seen_at) DESC
