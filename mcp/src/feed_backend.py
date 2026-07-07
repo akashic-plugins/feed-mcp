@@ -228,6 +228,19 @@ def _connect(cfg: FeedMcpConfig) -> sqlite3.Connection:
         )
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS rank_model_updates (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_id TEXT NOT NULL,
+            label INTEGER NOT NULL,
+            prediction REAL NOT NULL,
+            error REAL NOT NULL,
+            feature_count INTEGER NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
     _ensure_rank_stats(conn)
     _ensure_rank_model(conn, cfg)
     _normalize_existing_source_urls(conn)
@@ -1436,6 +1449,7 @@ def _update_rank_model_weights(
     label: int,
     learning_rate: float,
     updated_at: str,
+    event_id: str,
 ) -> None:
     weights = _rank_model_weights(conn, list(features))
     prediction = _sigmoid(sum(weights.get(key, 0.0) * value for key, value in features.items()))
@@ -1453,6 +1467,14 @@ def _update_rank_model_weights(
             """,
             (key, new_weight, updated_at),
         )
+    conn.execute(
+        """
+        INSERT INTO rank_model_updates(
+            event_id, label, prediction, error, feature_count, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (event_id, label, prediction, error, len(features), updated_at),
+    )
 
 
 def _ensure_rank_model(conn: sqlite3.Connection, cfg: FeedMcpConfig) -> None:
@@ -1462,7 +1484,7 @@ def _ensure_rank_model(conn: sqlite3.Connection, cfg: FeedMcpConfig) -> None:
     rows = conn.execute(
         """
         SELECT
-            source_id, source_name, author, title, content, published_at,
+            event_id, source_id, source_name, author, title, content, published_at,
             first_seen_at, served_count, last_served_at, interest_ok, interest_scored_at
         FROM items
         WHERE interest_ok IN (0, 1)
@@ -1714,6 +1736,7 @@ def _update_rank_model_for_row(
         interest_ok,
         cfg.rank_model_learning_rate,
         updated_at,
+        str(row["event_id"]),
     )
 
 
@@ -1943,7 +1966,7 @@ def acknowledge_events(
                 row = conn.execute(
                     """
                     SELECT
-                        source_id, source_name, author, title, content, published_at,
+                        event_id, source_id, source_name, author, title, content, published_at,
                         first_seen_at, served_count, last_served_at, interest_ok,
                         interest_scored_at
                     FROM items
