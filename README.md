@@ -10,23 +10,21 @@
 
 ```text
 feed-mcp
-├─ .aka-plugin/plugin.json
 ├─ plugin.py
 ├─ skills/
 │  ├─ feed-manage/
 │  └─ rsshub-route-finder/
 └─ mcp/
-   ├─ servers.json
    ├─ run_mcp.py
    └─ src/
 ```
 
 本仓库用于验证：
 
-- `.aka-plugin/plugin.json` 声明模型
+- `plugin.py` 程序化声明生命周期、skills、MCP 与主动信息源
 - `~/.akashic-plugin/cache` 下的 installed plugin 装载
 - skill 软链接
-- 插件声明式 MCP 注册
+- 插件程序化 MCP 注册
 
 运行时目录：
 
