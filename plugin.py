@@ -2,14 +2,56 @@ from __future__ import annotations
 
 import shutil
 from pathlib import Path
+from typing import cast
 
-from agent.plugins import Plugin
+from pydantic import BaseModel, Field
+
+from agent.plugins import McpServerSpec, Plugin, ProactiveSourceSpec
+
+
+class FeedProactiveConfig(BaseModel):
+    enabled: bool = True
+    poll_interval_seconds: int = Field(default=150, ge=1)
+
+
+class FeedConfig(BaseModel):
+    proactive: FeedProactiveConfig = Field(default_factory=FeedProactiveConfig)
 
 
 class FeedPlugin(Plugin):
     name = "feed"
-    version = "0.1.0"
+    version = "1.0.0"
     desc = "Feed MCP plugin"
+    ConfigModel = FeedConfig
+
+    @classmethod
+    def skill_roots(cls) -> tuple[str, ...]:
+        return ("skills",)
+
+    @classmethod
+    def mcp_servers(cls) -> list[McpServerSpec]:
+        return [
+            McpServerSpec(
+                name="feed",
+                command=("python", "mcp/run_mcp.py"),
+            )
+        ]
+
+    def proactive_sources(self) -> list[ProactiveSourceSpec]:
+        config = cast(FeedConfig, self.context.config)
+        if not config.proactive.enabled:
+            return []
+        return [
+            ProactiveSourceSpec(
+                id="subscriptions",
+                channels=("content",),
+                server="feed",
+                fetch_tool="get_proactive_events",
+                ack_tool="acknowledge_events",
+                poll_tool="poll_feeds",
+                poll_interval_seconds=config.proactive.poll_interval_seconds,
+            )
+        ]
 
     async def initialize(self) -> None:
         data_dir = self.context.data_dir
