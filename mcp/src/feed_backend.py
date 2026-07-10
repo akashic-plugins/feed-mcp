@@ -40,7 +40,7 @@ _DEFAULT_CONFIG = {
     "item_retention_hours": 72,
     "max_items_per_source": 100,
     "max_content_events": 50,
-    "rank_mode": "shadow",
+    "rank_mode": "ranked",
     "rank_impression_limit": 5,
     "rank_model_learning_rate": 0.08,
 }
@@ -87,7 +87,7 @@ def load_config() -> FeedMcpConfig:
         ),
         max_items_per_source=max(1, int(raw.get("max_items_per_source", 100))),
         max_content_events=max(1, int(raw["max_content_events"])),
-        rank_mode=str(raw.get("rank_mode", "shadow")),
+        rank_mode=str(raw.get("rank_mode", "ranked")),
         rank_impression_limit=max(1, int(raw.get("rank_impression_limit", 5))),
         rank_model_learning_rate=max(0.001, float(raw.get("rank_model_learning_rate", 0.08))),
     )
