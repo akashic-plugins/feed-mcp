@@ -11,7 +11,7 @@ from agent.plugins import McpServerSpec, Plugin, ProactiveSourceSpec
 
 class FeedProactiveConfig(BaseModel):
     enabled: bool = True
-    poll_interval_seconds: int = Field(default=150, ge=1)
+    poll_interval_seconds: int = Field(default=300, ge=1)
 
 
 class FeedConfig(BaseModel):

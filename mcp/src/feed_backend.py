@@ -624,7 +624,7 @@ def _fetch_via_requests(url: str, *, trace_id: str, source_name: str) -> str:
             )
             resp = requests.get(
                 url,
-                timeout=15,
+                timeout=(5, 10),
                 headers={
                     "User-Agent": "FreshRSS/1.24.0",
                     "Accept": "application/rss+xml, application/atom+xml, application/xml;q=0.9, text/xml;q=0.8, */*;q=0.5",
@@ -787,50 +787,16 @@ def _fetch_source_items(source: sqlite3.Row, limit: int, *, trace_id: str) -> li
             len(items),
         )
         return items
-    last_err: Exception | None = None
-    attempts = (0.0, 0.3)
-    for idx, delay in enumerate(attempts, start=1):
-        if delay > 0:
-            time.sleep(delay)
-        try:
-            logger.info(
-                "[feed][trace=%s] source=%s parse attempt=%d/%d",
-                trace_id,
-                source_name,
-                idx,
-                len(attempts),
-            )
-            text = _fetch_rss_text(str(source["url"]), trace_id=trace_id, source_name=source_name)
-            items = _parse_rss(text)[:limit]
-            logger.info(
-                "[feed][trace=%s] source=%s parse success attempt=%d items=%d",
-                trace_id,
-                source_name,
-                idx,
-                len(items),
-            )
-            return items
-        except ET.ParseError as e:
-            last_err = e
-            logger.warning(
-                "[feed][trace=%s] source=%s parse failed attempt=%d/%d err=%s",
-                trace_id,
-                source_name,
-                idx,
-                len(attempts),
-                _err_text(e),
-            )
-        except Exception as e:
-            last_err = e
-            logger.warning(
-                "[feed][trace=%s] source=%s fetch_or_parse failed attempt=%d/%d err=%s",
-                trace_id,
-                source_name,
-                idx,
-                len(attempts),
-                _err_text(e),
-            )
-    raise last_err or RuntimeError("source fetch failed")
+    logger.info("[feed][trace=%s] source=%s parse start", trace_id, source_name)
+    text = _fetch_rss_text(str(source["url"]), trace_id=trace_id, source_name=source_name)
+    items = _parse_rss(text)[:limit]
+    logger.info(
+        "[feed][trace=%s] source=%s parse success items=%d",
+        trace_id,
+        source_name,
+        len(items),
+    )
+    return items
 
 
 def _poll_source(
