@@ -1816,7 +1816,7 @@ def _rank_rows(
         ),
         reverse=True,
     )
-    coarse_limit = max(cfg.max_content_events, cfg.rank_impression_limit * 10)
+    coarse_limit = len(coarse_ranked)
     shortlist = _source_balanced_shortlist(coarse_ranked, coarse_limit)
     refined: list[tuple[sqlite3.Row, float, dict[str, float]]] = []
     for row, coarse_score, features in shortlist:
@@ -1915,7 +1915,6 @@ def get_proactive_events() -> list[dict[str, Any]]:
         _cleanup(conn, cfg)
         now = _now()
         published_after = (now - timedelta(hours=cfg.item_retention_hours)).isoformat()
-        candidate_limit = max(1000, cfg.max_content_events * 20)
         rows = conn.execute(
             """
             SELECT
@@ -1934,51 +1933,47 @@ def get_proactive_events() -> list[dict[str, Any]]:
             WHERE a.event_id IS NULL
               AND (i.published_at IS NOT NULL OR i.source_type != 'rss')
               AND coalesce(i.published_at, i.first_seen_at) >= ?
-            ORDER BY coalesce(i.published_at, i.first_seen_at) DESC
-            LIMIT ?
+            ORDER BY i.source_name ASC,
+                     coalesce(i.published_at, i.first_seen_at) DESC,
+                     i.first_seen_at DESC
             """,
-            (published_after, candidate_limit),
+            (published_after,),
         ).fetchall()
         ranked = _rank_rows(conn, cfg, list(rows), now)
         ranked_by_id = {str(row["event_id"]): (score, features) for row, score, features in ranked}
-        if cfg.rank_mode == "ranked":
-            selected = ranked[:cfg.max_content_events]
-        else:
-            selected = [
-                (
-                    row,
-                    ranked_by_id.get(str(row["event_id"]), (0.0, {}))[0],
-                    ranked_by_id.get(str(row["event_id"]), (0.0, {}))[1],
-                )
-                for row in rows[:cfg.max_content_events]
-            ]
-        _record_rank_impressions(
-            conn,
-            selected,
-            now,
-            min(cfg.rank_impression_limit, cfg.max_content_events),
-        )
-        conn.commit()
+        selected = [
+            (
+                row,
+                ranked_by_id.get(str(row["event_id"]), (0.0, {}))[0],
+                ranked_by_id.get(str(row["event_id"]), (0.0, {}))[1],
+            )
+            for row in rows
+        ]
         return [
             {
                 "event_id": row["event_id"],
                 "kind": "content",
                 "source_type": row["source_type"],
+                "source_id": row["source_id"],
                 "source_name": row["source_name"],
                 "title": row["title"],
                 "content": row["content"],
                 "url": row["url"],
                 "published_at": row["published_at"],
+                "first_seen_at": row["first_seen_at"],
                 "display_text": _build_display_text(row),
-                "rank_score": round(score, 6),
+                "preprocess_score": round(score, 6),
+                "preprocess_features": features,
             }
-            for row, score, _features in selected
+            for row, score, features in selected
         ]
     finally:
         conn.close()
 
 
-def _interest_ok_from_feedback(feedback: str) -> int:
+def _interest_ok_from_feedback(feedback: str | None) -> int | None:
+    if feedback is None or feedback == "consumed":
+        return None
     if feedback == "interesting":
         return 1
     if feedback == "not_interesting":
@@ -1988,7 +1983,7 @@ def _interest_ok_from_feedback(feedback: str) -> int:
 
 def acknowledge_events(
     event_ids: list[str],
-    feedback: str,
+    feedback: str | None = None,
 ) -> dict[str, list[str]]:
     cfg = load_config()
     conn = _connect(cfg)
@@ -2014,14 +2009,15 @@ def acknowledge_events(
                         (now + timedelta(hours=cfg.item_retention_hours)).isoformat(),
                     ),
                 )
-                conn.execute(
-                    """
-                    UPDATE items
-                    SET interest_ok = ?, interest_scored_at = ?
-                    WHERE event_id = ?
-                    """,
-                    (interest_ok, now.isoformat(), event_id),
-                )
+                if interest_ok is not None:
+                    conn.execute(
+                        """
+                        UPDATE items
+                        SET interest_ok = ?, interest_scored_at = ?
+                        WHERE event_id = ?
+                        """,
+                        (interest_ok, now.isoformat(), event_id),
+                    )
                 row = conn.execute(
                     """
                     SELECT
@@ -2032,7 +2028,7 @@ def acknowledge_events(
                     """,
                     (event_id,),
                 ).fetchone()
-                if row is not None:
+                if row is not None and interest_ok is not None:
                     _update_rank_stats_for_row(conn, row, interest_ok, now.isoformat())
                     _update_rank_model_for_row(conn, cfg, row, interest_ok, now.isoformat())
                 acked.append(event_id)

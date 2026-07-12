@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import List
+from typing import List, Optional
 
 from mcp.server.fastmcp import FastMCP
 
@@ -72,7 +72,7 @@ def create_mcp_server() -> FastMCP:
         return json.dumps(feed_backend.get_proactive_events(), ensure_ascii=False)
 
     @mcp.tool()
-    def acknowledge_events(event_ids: List[str], feedback: str) -> str:
+    def acknowledge_events(event_ids: List[str], feedback: Optional[str] = None) -> str:
         return json.dumps(
             feed_backend.acknowledge_events(event_ids, feedback=feedback),
             ensure_ascii=False,
