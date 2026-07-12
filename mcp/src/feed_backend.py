@@ -229,48 +229,6 @@ def _now() -> datetime:
     return datetime.now(UTC)
 
 
-def _cleanup(conn: sqlite3.Connection, cfg: FeedMcpConfig) -> None:
-    now = _now()
-    conn.execute(
-        "DELETE FROM acked_items WHERE expires_at <= ?",
-        (now.isoformat(),),
-    )
-    _delete_expired_items(conn, cfg, now)
-    _trim_items_per_source(conn, cfg.max_items_per_source)
-    conn.commit()
-
-
-def _delete_expired_items(conn: sqlite3.Connection, cfg: FeedMcpConfig, now: datetime) -> None:
-    cutoff = (now - timedelta(hours=cfg.item_retention_hours)).isoformat()
-    conn.execute(
-        """
-        DELETE FROM items
-        WHERE coalesce(published_at, last_seen_at) <= ?
-        """,
-        (cutoff,),
-    )
-
-
-def _trim_items_per_source(conn: sqlite3.Connection, max_items_per_source: int) -> None:
-    rows = conn.execute(
-        """
-        SELECT event_id, source_id
-        FROM items
-        ORDER BY coalesce(published_at, last_seen_at) DESC, last_seen_at DESC
-        """
-    ).fetchall()
-    keep_counts: dict[str, int] = {}
-    to_delete: list[str] = []
-    for row in rows:
-        source_id = str(row["source_id"])
-        keep_counts[source_id] = keep_counts.get(source_id, 0) + 1
-        if keep_counts[source_id] > max_items_per_source:
-            to_delete.append(str(row["event_id"]))
-    if not to_delete:
-        return
-    conn.executemany("DELETE FROM items WHERE event_id = ?", [(event_id,) for event_id in to_delete])
-
-
 def _delete_source_history(conn: sqlite3.Connection, source_ids: list[str]) -> tuple[int, int]:
     if not source_ids:
         return 0, 0
@@ -967,7 +925,6 @@ def feed_manage(action: str, name: str = "", url: str = "", source_type: str = "
     cfg = load_config()
     conn = _connect(cfg)
     try:
-        _cleanup(conn, cfg)
         if action == "list":
             rows = conn.execute(
                 "SELECT name, type, url, enabled, note FROM sources ORDER BY added_at DESC"
@@ -1121,7 +1078,6 @@ def feed_query(
     try:
         trace_id = _trace_id_short()
         # 1. 查询工具尽量复刻旧逻辑：每次查询前都主动刷新启用源，而不是只看旧缓存。
-        _cleanup(conn, cfg)
         enabled_rows = conn.execute(
             "SELECT * FROM sources WHERE enabled = 1 ORDER BY added_at DESC"
         ).fetchall()
@@ -1287,7 +1243,9 @@ _RANK_BIAS = -0.8
 _FRESHNESS_HALF_LIFE_HOURS = 36.0
 _EXPOSURE_RECENCY_HALF_LIFE_HOURS = 12.0
 _RECENT_CONTEXT_LIMIT = 100
-_MAX_SHORTLIST_SOURCE_SHARE = 0.4
+_SOURCE_DIVERSITY_DECAY = 0.5
+_SOURCE_DIVERSITY_FLOOR = 0.05
+_MISSING_PUBLICATION_CONFIDENCE = 0.03
 
 
 def _tokenize_rank_text(*parts: object) -> list[str]:
@@ -1479,7 +1437,8 @@ def _parse_rank_dt(value: object) -> datetime | None:
 def _freshness_score(row: sqlite3.Row, cfg: FeedMcpConfig, now: datetime) -> tuple[float, float]:
     ts = _parse_rank_dt(row["published_at"]) or _parse_rank_dt(row["first_seen_at"]) or now
     age_hours = max(0.0, (now - ts).total_seconds() / 3600.0)
-    return math.exp(-age_hours / _FRESHNESS_HALF_LIFE_HOURS), age_hours
+    confidence = 1.0 if row["published_at"] else _MISSING_PUBLICATION_CONFIDENCE
+    return confidence * math.exp(-age_hours / _FRESHNESS_HALF_LIFE_HOURS), age_hours
 
 
 def _recent_context_tokens(
@@ -1731,45 +1690,6 @@ def _update_rank_model_for_row(
     )
 
 
-def _source_balanced_shortlist(
-    ranked: list[tuple[sqlite3.Row, float, dict[str, float]]],
-    limit: int,
-) -> list[tuple[sqlite3.Row, float, dict[str, float]]]:
-    if len(ranked) <= limit:
-        return ranked
-    by_source: dict[str, list[tuple[sqlite3.Row, float, dict[str, float]]]] = {}
-    for item in ranked:
-        row = item[0]
-        source_key = str(row["source_id"] or row["source_name"] or "")
-        by_source.setdefault(source_key, []).append(item)
-    per_source = max(4, math.ceil(limit * _MAX_SHORTLIST_SOURCE_SHARE))
-    picked_ids: set[str] = set()
-    shortlist: list[tuple[sqlite3.Row, float, dict[str, float]]] = []
-    for items in by_source.values():
-        for item in items[:per_source]:
-            event_id = str(item[0]["event_id"])
-            if event_id in picked_ids:
-                continue
-            picked_ids.add(event_id)
-            shortlist.append(item)
-    shortlist.sort(
-        key=lambda item: (
-            item[1],
-            str(item[0]["published_at"] or item[0]["first_seen_at"] or ""),
-        ),
-        reverse=True,
-    )
-    for item in ranked:
-        if len(shortlist) >= limit:
-            break
-        event_id = str(item[0]["event_id"])
-        if event_id in picked_ids:
-            continue
-        picked_ids.add(event_id)
-        shortlist.append(item)
-    return shortlist[:limit]
-
-
 def _information_gain_score(ml_score: float, features: dict[str, float]) -> float:
     freshness = float(features.get("freshness", 0.0))
     novelty = float(features.get("novelty", 1.0))
@@ -1816,10 +1736,8 @@ def _rank_rows(
         ),
         reverse=True,
     )
-    coarse_limit = len(coarse_ranked)
-    shortlist = _source_balanced_shortlist(coarse_ranked, coarse_limit)
     refined: list[tuple[sqlite3.Row, float, dict[str, float]]] = []
-    for row, coarse_score, features in shortlist:
+    for row, coarse_score, features in coarse_ranked:
         ml_features = _model_feature_values(row, features)
         ml_score = _predict_rank_model(conn, ml_features)
         merged = dict(features)
@@ -1837,27 +1755,29 @@ def _rank_rows(
         ),
         reverse=True,
     )
-    head_limit = min(cfg.rank_impression_limit, len(refined))
-    if head_limit <= 1:
-        return refined
-
-    max_per_source = max(1, head_limit // 2)
     source_counts: dict[str, int] = {}
-    head: list[tuple[sqlite3.Row, float, dict[str, float]]] = []
-    tail: list[tuple[sqlite3.Row, float, dict[str, float]]] = []
-    for item in refined:
-        row = item[0]
+    adjusted: list[tuple[sqlite3.Row, float, dict[str, float]]] = []
+    for row, score, features in refined:
         source_key = str(row["source_id"] or row["source_name"] or "")
-        if len(head) < head_limit and source_counts.get(source_key, 0) < max_per_source:
-            source_counts[source_key] = source_counts.get(source_key, 0) + 1
-            head.append(item)
-        else:
-            tail.append(item)
-    if len(head) < head_limit:
-        missing = head_limit - len(head)
-        head.extend(tail[:missing])
-        tail = tail[missing:]
-    return head + tail
+        position = source_counts.get(source_key, 0)
+        multiplier = (
+            (1.0 - _SOURCE_DIVERSITY_FLOOR)
+            * (_SOURCE_DIVERSITY_DECAY ** position)
+            + _SOURCE_DIVERSITY_FLOOR
+        )
+        source_counts[source_key] = position + 1
+        merged = dict(features)
+        merged["source_diversity"] = multiplier
+        adjusted.append((row, score * multiplier, merged))
+    return sorted(
+        adjusted,
+        key=lambda item: (
+            item[1],
+            item[2].get("coarse_score", 0.0),
+            str(item[0]["published_at"] or item[0]["first_seen_at"] or ""),
+        ),
+        reverse=True,
+    )
 
 
 def _record_rank_impressions(
@@ -1888,7 +1808,6 @@ def poll_feeds_only() -> None:
     conn = _connect(cfg)
     try:
         trace_id = _trace_id_short()
-        _cleanup(conn, cfg)
         sources = conn.execute(
             "SELECT * FROM sources WHERE enabled = 1 ORDER BY added_at DESC"
         ).fetchall()
@@ -1912,9 +1831,7 @@ def get_proactive_events() -> list[dict[str, Any]]:
     conn = _connect(cfg)
     try:
         # 纯 DB 查询，不触发轮询。轮询由 proactive loop 通过 poll_feeds 工具独立驱动。
-        _cleanup(conn, cfg)
         now = _now()
-        published_after = (now - timedelta(hours=cfg.item_retention_hours)).isoformat()
         rows = conn.execute(
             """
             SELECT
@@ -1931,13 +1848,11 @@ def get_proactive_events() -> list[dict[str, Any]]:
             FROM items i
             LEFT JOIN acked_items a ON a.event_id = i.event_id
             WHERE a.event_id IS NULL
-              AND i.published_at IS NOT NULL
-              AND i.published_at >= ?
             ORDER BY i.source_name ASC,
+                     i.published_at IS NULL ASC,
                      i.published_at DESC,
                      i.first_seen_at DESC
             """,
-            (published_after,),
         ).fetchall()
         ranked = _rank_rows(conn, cfg, list(rows), now)
         ranked_by_id = {str(row["event_id"]): (score, features) for row, score, features in ranked}
@@ -1992,7 +1907,6 @@ def acknowledge_events(
     failed: list[str] = []
     try:
         interest_ok = _interest_ok_from_feedback(feedback)
-        _cleanup(conn, cfg)
         for event_id in event_ids:
             try:
                 conn.execute(
@@ -2047,7 +1961,6 @@ def startup_force_poll() -> None:
     conn = _connect(cfg)
     try:
         trace_id = _trace_id_short()
-        _cleanup(conn, cfg)
         sources = conn.execute(
             "SELECT * FROM sources WHERE enabled = 1 ORDER BY added_at DESC"
         ).fetchall()

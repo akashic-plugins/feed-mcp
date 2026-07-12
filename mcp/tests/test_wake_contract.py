@@ -90,8 +90,13 @@ def test_wake_fetch_returns_all_unread_grouped_by_source_and_consumption_is_not_
     assert row["interest_scored_at"] is None
     assert updates == 0
 
+    monkeypatch.setattr(feed_backend, "_now", lambda: now + timedelta(days=10))
+    assert consumed not in {
+        event["event_id"] for event in feed_backend.get_proactive_events()
+    }
 
-def test_wake_fetch_excludes_missing_and_stale_publication_even_when_just_seen(
+
+def test_wake_fetch_keeps_missing_and_stale_with_continuous_freshness_penalty(
     tmp_path, monkeypatch
 ):
     now = datetime(2026, 7, 12, 12, tzinfo=UTC)
@@ -126,7 +131,17 @@ def test_wake_fetch_excludes_missing_and_stale_publication_even_when_just_seen(
 
     events = feed_backend.get_proactive_events()
 
-    assert [event["event_id"] for event in events] == ["fresh"]
+    assert [event["event_id"] for event in events] == ["fresh", "stale", "missing"]
+    scores = {event["event_id"]: event["preprocess_score"] for event in events}
+    assert scores["fresh"] > scores["missing"]
+    assert scores["fresh"] > scores["stale"]
+
+    conn = feed_backend._connect(cfg)
+    try:
+        remaining = conn.execute("SELECT COUNT(*) FROM items").fetchone()[0]
+    finally:
+        conn.close()
+    assert remaining == 3
 
 
 def test_feedparser_reads_rfc2822_namespace_date_and_stable_entry_id():
