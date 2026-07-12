@@ -71,6 +71,7 @@ def _runtime_root() -> Path:
     path.mkdir(parents=True, exist_ok=True)
     return path
 
+
 def load_config() -> FeedMcpConfig:
     raw = dict(_DEFAULT_CONFIG)
     path = _config_path()
@@ -96,8 +97,10 @@ def load_config() -> FeedMcpConfig:
 
 def _connect(cfg: FeedMcpConfig) -> sqlite3.Connection:
     cfg.db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(cfg.db_path)
+    conn = sqlite3.connect(cfg.db_path, timeout=30)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=30000")
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS sources (
@@ -1811,7 +1814,7 @@ def _record_rank_impressions(
 
 def poll_feeds_only() -> None:
     """按需轮询所有启用源（尊重 poll_ttl_seconds），不返回内容。
-    由 proactive loop 按固定周期调用，与 get_proactive_events 完全解耦。
+    由 MCP lifespan 按固定周期调用，与 get_proactive_events 完全解耦。
     单源失败已在 _poll_rows 内部隔离；系统级异常（DB 不可用、配置损坏等）直接上抛，
     由调用方决定如何处理，避免故障被静默吞掉。
     """
@@ -1841,7 +1844,7 @@ def get_proactive_events(*, offset: int = 0, limit: int = 50) -> list[dict[str, 
     cfg = load_config()
     conn = _connect(cfg)
     try:
-        # 纯 DB 查询，不触发轮询。轮询由 proactive loop 通过 poll_feeds 工具独立驱动。
+        # 纯 DB 查询，不触发轮询。MCP lifespan 独立维护缓存 freshness。
         now = _now()
         rows = conn.execute(
             """
@@ -1962,31 +1965,5 @@ def acknowledge_events(
                 failed.append(event_id)
         conn.commit()
         return {"acknowledged": acked, "failed": failed}
-    finally:
-        conn.close()
-
-
-def startup_force_poll() -> None:
-    """MCP 服务启动时主动拉一次所有启用源，忽略 poll_ttl 限制。"""
-    cfg = load_config()
-    conn = _connect(cfg)
-    try:
-        trace_id = _trace_id_short()
-        sources = conn.execute(
-            "SELECT * FROM sources WHERE enabled = 1 ORDER BY added_at DESC"
-        ).fetchall()
-        logger.info("[feed][trace=%s] startup force poll: %d sources", trace_id, len(sources))
-        summary = _poll_rows(conn, cfg, sources, force=True, trace_id=trace_id)
-        conn.commit()
-        logger.info(
-            "[feed][trace=%s] startup force poll done total=%d success=%d failed=%d failed_sources=%s",
-            trace_id,
-            int(summary["total"]),
-            int(summary["success"]),
-            int(summary["failed"]),
-            summary["failed_sources"],
-        )
-    except Exception as e:
-        logger.warning("[feed] startup force poll failed: %s", _err_text(e))
     finally:
         conn.close()

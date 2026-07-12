@@ -11,7 +11,6 @@ from agent.plugins import McpServerSpec, Plugin, ProactiveSourceSpec
 
 class FeedProactiveConfig(BaseModel):
     enabled: bool = True
-    poll_interval_seconds: int = Field(default=300, ge=1)
 
 
 class FeedConfig(BaseModel):
@@ -20,7 +19,7 @@ class FeedConfig(BaseModel):
 
 class FeedPlugin(Plugin):
     name = "feed"
-    version = "1.1.0"
+    version = "1.2.0"
     desc = "Feed MCP plugin"
     ConfigModel = FeedConfig
 
@@ -48,8 +47,6 @@ class FeedPlugin(Plugin):
                 server="feed",
                 fetch_tool="get_proactive_events",
                 ack_tool="acknowledge_events",
-                poll_tool="poll_feeds",
-                poll_interval_seconds=config.proactive.poll_interval_seconds,
                 fetch_page_size=50,
             )
         ]

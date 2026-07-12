@@ -4,7 +4,7 @@
 
 - `lifecycle`: 最小 `FeedPlugin`
 - `skills`: `feed-manage` 与 `rsshub-route-finder`
-- `mcp`: feed 订阅查询与主动轮询工具
+- `mcp`: feed 订阅查询、缓存自刷新与主动事件读取
 
 目录结构：
 
@@ -59,6 +59,14 @@ feed-mcp
 - 历史内容保存在 sqlite `items`
 - 主动推送确认状态保存在 sqlite `acked_items`
 - 轮询状态保存在 sqlite `poll_state`
+
+缓存 freshness：
+
+- MCP 进程通过 FastMCP lifespan 启动唯一后台 poller
+- 启动后立即刷新一次；首次主动事件读取会等待该刷新完成
+- 后续按 `feed_mcp.json` 的 `poll_ttl_seconds` 定时刷新
+- `get_proactive_events` 只读取稳定缓存，不承担网络抓取
+- SQLite 使用 WAL 和 busy timeout，轮询写入不会阻塞缓存快照读取
 
 首次迁移行为：
 

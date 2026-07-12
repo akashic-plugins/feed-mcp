@@ -2,9 +2,11 @@ from __future__ import annotations
 
 # pyright: reportMissingImports=false
 
+import asyncio
 import json
 import logging
-from typing import List, Optional
+from contextlib import asynccontextmanager
+from typing import AsyncIterator, List, Optional
 
 from mcp.server.fastmcp import FastMCP
 
@@ -13,8 +15,85 @@ from src import feed_backend
 logger = logging.getLogger(__name__)
 
 
+class FeedPoller:
+    """维护 Feed 缓存刷新，并向读取方暴露首次刷新结果。"""
+
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+        self._ready = asyncio.Event()
+        self._stop = asyncio.Event()
+        self._task: asyncio.Task[None] | None = None
+        self._last_error: Exception | None = None
+
+    async def start(self) -> None:
+        if self._task is not None:
+            raise RuntimeError("Feed poller 已启动")
+        self._task = asyncio.create_task(self._run(), name="feed-cache-poller")
+
+    async def stop(self) -> None:
+        self._stop.set()
+        if self._task is None:
+            return
+        self._task.cancel()
+        await asyncio.gather(self._task, return_exceptions=True)
+        self._task = None
+
+    async def poll_now(self) -> None:
+        async with self._lock:
+            try:
+                await asyncio.to_thread(feed_backend.poll_feeds_only)
+            except Exception as exc:
+                self._last_error = exc
+                raise
+            self._last_error = None
+
+    async def require_fresh_cache(self) -> None:
+        await self._ready.wait()
+        if self._last_error is not None:
+            raise RuntimeError("Feed 缓存刷新失败") from self._last_error
+
+    async def _run(self) -> None:
+        """首次立即刷新，随后按缓存 TTL 持续刷新。"""
+
+        # 1. 首次刷新完成后才允许主动链读取缓存。
+        try:
+            await self.poll_now()
+        except Exception:
+            logger.exception("[feed] 首次缓存刷新失败")
+        finally:
+            self._ready.set()
+
+        # 2. 后续失败显式记录，并保留下一轮重试能力。
+        while not self._stop.is_set():
+            try:
+                interval = feed_backend.load_config().poll_ttl_seconds
+            except Exception as exc:
+                self._last_error = exc
+                logger.exception("[feed] 读取轮询配置失败")
+                interval = 60
+            try:
+                await asyncio.wait_for(self._stop.wait(), timeout=interval)
+                return
+            except TimeoutError:
+                pass
+            try:
+                await self.poll_now()
+            except Exception:
+                logger.exception("[feed] 后台缓存刷新失败")
+
+
 def create_mcp_server() -> FastMCP:
-    mcp = FastMCP("feed-mcp")
+    poller = FeedPoller()
+
+    @asynccontextmanager
+    async def lifespan(_: FastMCP) -> AsyncIterator[None]:
+        await poller.start()
+        try:
+            yield None
+        finally:
+            await poller.stop()
+
+    mcp = FastMCP("feed-mcp", lifespan=lifespan)
 
     @mcp.tool()
     def feed_manage(
@@ -59,18 +138,24 @@ def create_mcp_server() -> FastMCP:
         )
 
     @mcp.tool()
-    def poll_feeds() -> str:
+    async def poll_feeds() -> str:
         try:
-            feed_backend.poll_feeds_only()
+            await poller.poll_now()
             return "ok"
         except Exception as e:
             logger.exception("[feed] poll_feeds 系统级失败")
             return f"error: {e}"
 
     @mcp.tool()
-    def get_proactive_events(offset: int = 0, limit: int = 50) -> str:
+    async def get_proactive_events(offset: int = 0, limit: int = 50) -> str:
+        await poller.require_fresh_cache()
+        events = await asyncio.to_thread(
+            feed_backend.get_proactive_events,
+            offset=offset,
+            limit=limit,
+        )
         return json.dumps(
-            feed_backend.get_proactive_events(offset=offset, limit=limit),
+            events,
             ensure_ascii=False,
         )
 
