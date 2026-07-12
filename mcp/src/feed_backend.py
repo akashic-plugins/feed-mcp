@@ -1246,6 +1246,7 @@ _RECENT_CONTEXT_LIMIT = 100
 _SOURCE_DIVERSITY_DECAY = 0.5
 _SOURCE_DIVERSITY_FLOOR = 0.05
 _MISSING_PUBLICATION_CONFIDENCE = 0.03
+_WAKE_ADMISSION_FLOOR = 0.02
 
 
 def _tokenize_rank_text(*parts: object) -> list[str]:
@@ -1438,7 +1439,17 @@ def _freshness_score(row: sqlite3.Row, cfg: FeedMcpConfig, now: datetime) -> tup
     ts = _parse_rank_dt(row["published_at"]) or _parse_rank_dt(row["first_seen_at"]) or now
     age_hours = max(0.0, (now - ts).total_seconds() / 3600.0)
     confidence = 1.0 if row["published_at"] else _MISSING_PUBLICATION_CONFIDENCE
-    return confidence * math.exp(-age_hours / _FRESHNESS_HALF_LIFE_HOURS), age_hours
+    return (
+        confidence
+        * math.exp(-math.log(2.0) * age_hours / _FRESHNESS_HALF_LIFE_HOURS),
+        age_hours,
+    )
+
+
+def _wake_admission_score(features: dict[str, float]) -> float:
+    interest = min(0.999, max(0.0, float(features.get("interest", 0.0))))
+    freshness = min(1.0, max(0.0, float(features.get("freshness", 0.0))))
+    return -math.log1p(-interest) * freshness
 
 
 def _recent_context_tokens(
@@ -1826,7 +1837,7 @@ def poll_feeds_only() -> None:
         conn.close()
 
 
-def get_proactive_events() -> list[dict[str, Any]]:
+def get_proactive_events(*, offset: int = 0, limit: int = 50) -> list[dict[str, Any]]:
     cfg = load_config()
     conn = _connect(cfg)
     try:
@@ -1856,14 +1867,16 @@ def get_proactive_events() -> list[dict[str, Any]]:
         ).fetchall()
         ranked = _rank_rows(conn, cfg, list(rows), now)
         ranked_by_id = {str(row["event_id"]): (score, features) for row, score, features in ranked}
-        selected = [
-            (
-                row,
-                ranked_by_id.get(str(row["event_id"]), (0.0, {}))[0],
-                ranked_by_id.get(str(row["event_id"]), (0.0, {}))[1],
-            )
-            for row in rows
-        ]
+        admitted = []
+        for row in rows:
+            score, features = ranked_by_id.get(str(row["event_id"]), (0.0, {}))
+            admission_score = _wake_admission_score(features)
+            if admission_score < _WAKE_ADMISSION_FLOOR:
+                continue
+            visible_features = dict(features)
+            visible_features["wake_admission_score"] = admission_score
+            admitted.append((row, score, visible_features))
+        selected = admitted[max(0, offset):max(0, offset) + max(1, limit)]
         return [
             {
                 "event_id": row["event_id"],
@@ -1872,11 +1885,9 @@ def get_proactive_events() -> list[dict[str, Any]]:
                 "source_id": row["source_id"],
                 "source_name": row["source_name"],
                 "title": row["title"],
-                "content": row["content"],
                 "url": row["url"],
                 "published_at": row["published_at"],
                 "first_seen_at": row["first_seen_at"],
-                "display_text": _build_display_text(row),
                 "preprocess_score": round(score, 6),
                 "preprocess_features": features,
             }

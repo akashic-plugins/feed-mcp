@@ -50,6 +50,7 @@ class FeedPlugin(Plugin):
                 ack_tool="acknowledge_events",
                 poll_tool="poll_feeds",
                 poll_interval_seconds=config.proactive.poll_interval_seconds,
+                fetch_page_size=50,
             )
         ]
 

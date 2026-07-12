@@ -61,7 +61,7 @@ def test_wake_fetch_returns_all_unread_grouped_by_source_and_consumption_is_not_
     finally:
         conn.close()
 
-    events = feed_backend.get_proactive_events()
+    events = feed_backend.get_proactive_events(limit=100)
 
     assert len(events) == 60
     assert [event["source_name"] for event in events] == ["Alpha"] * 30 + ["Beta"] * 30
@@ -92,11 +92,11 @@ def test_wake_fetch_returns_all_unread_grouped_by_source_and_consumption_is_not_
 
     monkeypatch.setattr(feed_backend, "_now", lambda: now + timedelta(days=10))
     assert consumed not in {
-        event["event_id"] for event in feed_backend.get_proactive_events()
+        event["event_id"] for event in feed_backend.get_proactive_events(limit=100)
     }
 
 
-def test_wake_fetch_keeps_missing_and_stale_with_continuous_freshness_penalty(
+def test_wake_fetch_admits_only_content_above_decayed_mass_floor(
     tmp_path, monkeypatch
 ):
     now = datetime(2026, 7, 12, 12, tzinfo=UTC)
@@ -131,10 +131,7 @@ def test_wake_fetch_keeps_missing_and_stale_with_continuous_freshness_penalty(
 
     events = feed_backend.get_proactive_events()
 
-    assert [event["event_id"] for event in events] == ["fresh", "stale", "missing"]
-    scores = {event["event_id"]: event["preprocess_score"] for event in events}
-    assert scores["fresh"] > scores["missing"]
-    assert scores["fresh"] > scores["stale"]
+    assert [event["event_id"] for event in events] == ["fresh"]
 
     conn = feed_backend._connect(cfg)
     try:
@@ -142,6 +139,15 @@ def test_wake_fetch_keeps_missing_and_stale_with_continuous_freshness_penalty(
     finally:
         conn.close()
     assert remaining == 3
+
+
+def test_missing_publication_requires_strong_interest_to_enter_transport():
+    assert feed_backend._wake_admission_score(
+        {"interest": 0.45, "freshness": 0.03}
+    ) < feed_backend._WAKE_ADMISSION_FLOOR
+    assert feed_backend._wake_admission_score(
+        {"interest": 0.9, "freshness": 0.03}
+    ) > feed_backend._WAKE_ADMISSION_FLOOR
 
 
 def test_feedparser_reads_rfc2822_namespace_date_and_stable_entry_id():

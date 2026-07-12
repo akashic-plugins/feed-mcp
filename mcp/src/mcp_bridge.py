@@ -68,8 +68,11 @@ def create_mcp_server() -> FastMCP:
             return f"error: {e}"
 
     @mcp.tool()
-    def get_proactive_events() -> str:
-        return json.dumps(feed_backend.get_proactive_events(), ensure_ascii=False)
+    def get_proactive_events(offset: int = 0, limit: int = 50) -> str:
+        return json.dumps(
+            feed_backend.get_proactive_events(offset=offset, limit=limit),
+            ensure_ascii=False,
+        )
 
     @mcp.tool()
     def acknowledge_events(event_ids: List[str], feedback: Optional[str] = None) -> str:
