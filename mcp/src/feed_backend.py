@@ -28,6 +28,7 @@ from typing import Any
 from urllib.parse import unquote, urlparse
 
 import requests
+import feedparser
 
 logger = logging.getLogger(__name__)
 
@@ -301,12 +302,20 @@ def _delete_source_history(conn: sqlite3.Connection, source_ids: list[str]) -> t
     return deleted_items, deleted_acked
 
 
-def _stable_event_id(source_id: str, url: str, title: str, published_at: str | None) -> str:
+def _stable_event_id(
+    source_id: str,
+    url: str,
+    title: str,
+    published_at: str | None,
+    entry_id: str | None = None,
+) -> str:
     item_key = _canonical_item_key(url or "")
     if item_key.startswith("xstatus:"):
         raw = "|".join([source_id, item_key])
+    elif entry_id or item_key:
+        raw = "|".join([source_id, str(entry_id or item_key)])
     else:
-        raw = "|".join([source_id, item_key, title or "", published_at or ""])
+        raw = "|".join([source_id, title or "", published_at or ""])
     return "fmcp_" + hashlib.sha1(raw.encode()).hexdigest()[:16]
 
 
@@ -521,47 +530,29 @@ def _parse_rss(xml_text: str) -> list[dict[str, str | None]]:
     xml_text = _normalize_xml_text(xml_text)
     if _is_xcancel_whitelist_feed(xml_text):
         return []
-    root = ET.fromstring(xml_text)
+    feed = feedparser.parse(xml_text)
     items: list[dict[str, str | None]] = []
-    if root.tag.endswith("feed"):
-        ns = {"a": root.tag.split("}")[0].strip("{")} if "}" in root.tag else {}
-        for entry in root.findall("a:entry" if ns else "entry", ns):
-            link = None
-            for link_el in entry.findall("a:link" if ns else "link", ns):
-                href = link_el.attrib.get("href")
-                rel = link_el.attrib.get("rel", "alternate")
-                if href and rel == "alternate":
-                    link = href
-                    break
-            items.append(
-                {
-                    "title": _strip((entry.findtext("a:title", default="", namespaces=ns) if ns else entry.findtext("title"))),
-                    "content": _strip_html(_strip(
-                        (entry.findtext("a:summary", default="", namespaces=ns) if ns else entry.findtext("summary"))
-                        or (entry.findtext("a:content", default="", namespaces=ns) if ns else entry.findtext("content"))
-                    ))[:_MAX_CONTENT],
-                    "url": link,
-                    "author": _strip(
-                        (entry.findtext("a:author/a:name", default="", namespaces=ns) if ns else "")
-                        or (entry.findtext("author/name") if not ns else "")
-                    ) or None,
-                    "published_at": _parse_dt(
-                        (entry.findtext("a:published", default="", namespaces=ns) if ns else entry.findtext("published"))
-                        or (entry.findtext("a:updated", default="", namespaces=ns) if ns else entry.findtext("updated"))
-                    ),
-                }
-            )
-        return items
-    for item in root.findall(".//item"):
+    for entry in feed.entries:
+        content_parts = entry.get("content") or []
+        content = (
+            str(content_parts[0].get("value") or "")
+            if content_parts
+            else str(entry.get("summary") or entry.get("description") or "")
+        )
+        parsed_time = entry.get("published_parsed") or entry.get("updated_parsed")
+        published_at = (
+            datetime(*parsed_time[:6], tzinfo=UTC).isoformat()
+            if isinstance(parsed_time, time.struct_time)
+            else _parse_dt(str(entry.get("published") or entry.get("updated") or ""))
+        )
         items.append(
             {
-                "title": _find_child_text(item, "title"),
-                "content": _strip_html(
-                    _find_child_text(item, "description") or _find_child_text(item, "encoded")
-                )[:_MAX_CONTENT],
-                "url": _find_child_text(item, "link") or None,
-                "author": _find_child_text(item, "author", "creator") or None,
-                "published_at": _parse_dt(_find_child_text(item, "pubDate", "date", "published", "updated")),
+                "entry_id": _strip(str(entry.get("id") or entry.get("guid") or "")) or None,
+                "title": _strip(str(entry.get("title") or "")),
+                "content": _strip_html(content)[:_MAX_CONTENT],
+                "url": _strip(str(entry.get("link") or "")) or None,
+                "author": _strip(str(entry.get("author") or "")) or None,
+                "published_at": published_at,
             }
         )
     return items
@@ -844,6 +835,7 @@ def _poll_source(
         url = _normalize_item_url(item.get("url"))
         author = str(item.get("author") or "").strip() or None
         published_at = str(item.get("published_at") or "").strip() or None
+        entry_id = str(item.get("entry_id") or "").strip() or None
         if not (title or content):
             skipped_empty_count += 1
             continue
@@ -852,17 +844,20 @@ def _poll_source(
         if display_title and len(sample_titles) < 3:
             sample_titles.append(display_title[:80])
 
-        event_id = _stable_event_id(source_id, url or "", title, published_at)
+        event_id = _stable_event_id(
+            source_id, url or "", title, published_at, entry_id
+        )
+        content_hash = hashlib.sha1((title + "\n" + content).encode()).hexdigest()[:16]
         exists = conn.execute(
-            "SELECT 1 FROM items WHERE event_id = ? LIMIT 1",
+            "SELECT content_hash FROM items WHERE event_id = ? LIMIT 1",
             (event_id,),
         ).fetchone()
         if exists:
             updated_count += 1
         else:
             inserted_count += 1
-
-        content_hash = hashlib.sha1((title + "\n" + content).encode()).hexdigest()[:16]
+        if exists is not None and str(exists["content_hash"] or "") != content_hash:
+            conn.execute("DELETE FROM acked_items WHERE event_id = ?", (event_id,))
         conn.execute(
             """
             INSERT INTO items (
@@ -876,6 +871,11 @@ def _poll_source(
                 url=excluded.url,
                 author=excluded.author,
                 published_at=excluded.published_at,
+                first_seen_at=CASE
+                    WHEN items.content_hash != excluded.content_hash
+                    THEN excluded.first_seen_at
+                    ELSE items.first_seen_at
+                END,
                 last_seen_at=excluded.last_seen_at,
                 content_hash=excluded.content_hash
             """,
@@ -1931,10 +1931,10 @@ def get_proactive_events() -> list[dict[str, Any]]:
             FROM items i
             LEFT JOIN acked_items a ON a.event_id = i.event_id
             WHERE a.event_id IS NULL
-              AND (i.published_at IS NOT NULL OR i.source_type != 'rss')
-              AND coalesce(i.published_at, i.first_seen_at) >= ?
+              AND i.published_at IS NOT NULL
+              AND i.published_at >= ?
             ORDER BY i.source_name ASC,
-                     coalesce(i.published_at, i.first_seen_at) DESC,
+                     i.published_at DESC,
                      i.first_seen_at DESC
             """,
             (published_after,),
