@@ -16,14 +16,12 @@ logger = logging.getLogger(__name__)
 
 
 class FeedPoller:
-    """维护 Feed 缓存刷新，并向读取方暴露首次刷新结果。"""
+    """在后台维护 Feed 缓存刷新，不阻塞缓存读取。"""
 
     def __init__(self) -> None:
         self._lock = asyncio.Lock()
-        self._ready = asyncio.Event()
         self._stop = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
-        self._last_error: Exception | None = None
 
     async def start(self) -> None:
         if self._task is not None:
@@ -40,35 +38,22 @@ class FeedPoller:
 
     async def poll_now(self) -> None:
         async with self._lock:
-            try:
-                await asyncio.to_thread(feed_backend.poll_feeds_only)
-            except Exception as exc:
-                self._last_error = exc
-                raise
-            self._last_error = None
-
-    async def require_fresh_cache(self) -> None:
-        await self._ready.wait()
-        if self._last_error is not None:
-            raise RuntimeError("Feed 缓存刷新失败") from self._last_error
+            await asyncio.to_thread(feed_backend.poll_feeds_only)
 
     async def _run(self) -> None:
         """首次立即刷新，随后按缓存 TTL 持续刷新。"""
 
-        # 1. 首次刷新完成后才允许主动链读取缓存。
+        # 1. 首次刷新在后台执行，读取方始终可以使用现有缓存
         try:
             await self.poll_now()
         except Exception:
             logger.exception("[feed] 首次缓存刷新失败")
-        finally:
-            self._ready.set()
 
-        # 2. 后续失败显式记录，并保留下一轮重试能力。
+        # 2. 后续失败显式记录，并保留下一轮重试能力
         while not self._stop.is_set():
             try:
                 interval = feed_backend.load_config().poll_ttl_seconds
-            except Exception as exc:
-                self._last_error = exc
+            except Exception:
                 logger.exception("[feed] 读取轮询配置失败")
                 interval = 60
             try:
@@ -148,7 +133,6 @@ def create_mcp_server() -> FastMCP:
 
     @mcp.tool()
     async def get_proactive_events(offset: int = 0, limit: int = 50) -> str:
-        await poller.require_fresh_cache()
         events = await asyncio.to_thread(
             feed_backend.get_proactive_events,
             offset=offset,
