@@ -10,19 +10,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from scripts.evaluate_ranker import _labels_from_proactive_feedback
+from scripts.path_config import resolve_feed_db, resolve_workspace_path
 from src import feed_backend
-
-
-def _default_feed_db() -> Path:
-    return Path.home() / ".akashic-plugin" / "data" / "feed-lab" / "feed_mcp.sqlite3"
-
-
-def _default_feedback_db() -> Path:
-    return Path.home() / ".akashic" / "workspace" / "proactive_feedback" / "proactive_feedback.db"
-
-
-def _default_sessions_db() -> Path:
-    return Path.home() / ".akashic" / "workspace" / "sessions.db"
 
 
 def _label(event_id: str, fallback_labels: dict[str, int], feedback_labels: dict[str, int] | None) -> int | None:
@@ -160,13 +149,20 @@ def replay(
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--feed-db", type=Path, default=_default_feed_db())
-    parser.add_argument("--feedback-db", type=Path, default=_default_feedback_db())
-    parser.add_argument("--sessions-db", type=Path, default=_default_sessions_db())
+    parser.add_argument("--feed-db", type=Path)
+    parser.add_argument("--feedback-db", type=Path)
+    parser.add_argument("--sessions-db", type=Path)
     parser.add_argument("--ticks", type=int, default=20)
     parser.add_argument("-k", type=int, default=5)
     args = parser.parse_args()
-    replay(args.feed_db, args.feedback_db, args.sessions_db, args.ticks, args.k)
+    feed_db = resolve_feed_db(args.feed_db)
+    feedback_db = resolve_workspace_path(
+        args.feedback_db,
+        "proactive_feedback",
+        "proactive_feedback.db",
+    )
+    sessions_db = resolve_workspace_path(args.sessions_db, "sessions.db")
+    replay(feed_db, feedback_db, sessions_db, args.ticks, args.k)
 
 
 if __name__ == "__main__":

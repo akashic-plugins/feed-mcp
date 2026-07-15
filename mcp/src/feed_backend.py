@@ -66,20 +66,21 @@ def _config_path() -> Path:
 def _runtime_root() -> Path:
     raw = os.environ.get("AKA_PLUGIN_DATA_DIR", "").strip()
     if not raw:
-        return _config_path().parent
+        raise RuntimeError("feed backend 缺少 AKA_PLUGIN_DATA_DIR")
     path = Path(raw).expanduser()
     path.mkdir(parents=True, exist_ok=True)
     return path
 
 
 def load_config() -> FeedMcpConfig:
+    runtime_root = _runtime_root()
     raw = dict(_DEFAULT_CONFIG)
     path = _config_path()
     if path.exists():
         raw.update(json.loads(path.read_text()))
     db_path = Path(str(raw["db_path"]))
     if not db_path.is_absolute():
-        db_path = (_runtime_root() / db_path).resolve()
+        db_path = (runtime_root / db_path).resolve()
     return FeedMcpConfig(
         db_path=db_path,
         poll_ttl_seconds=max(60, int(raw["poll_ttl_seconds"])),
