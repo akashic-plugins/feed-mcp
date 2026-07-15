@@ -6,10 +6,10 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 
-def _runtime_dir(script_dir: Path) -> Path:
+def _runtime_dir() -> Path:
     raw = os.environ.get("AKA_PLUGIN_DATA_DIR", "").strip()
     if not raw:
-        return script_dir
+        raise RuntimeError("feed MCP 缺少 AKA_PLUGIN_DATA_DIR")
     path = Path(raw).expanduser()
     path.mkdir(parents=True, exist_ok=True)
     return path
@@ -50,7 +50,7 @@ def main() -> None:
         sys.path.insert(0, str(script_dir))
 
     # 2. 初始化日志（落盘 + stderr）。
-    _setup_logging(_runtime_dir(script_dir))
+    _setup_logging(_runtime_dir())
 
     # 3. 启动 MCP stdio 服务。
     from src.mcp_bridge import create_mcp_server

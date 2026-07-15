@@ -70,8 +70,8 @@ feed-mcp
 
 首次迁移行为：
 
-- 插件首次启动时，如果 `~/.akashic-plugin/data/feed-<marketplace>/feed_mcp.sqlite3` 不存在
+- 插件首次启动时，如果 `$AKA_PLUGIN_DATA_DIR/feed_mcp.sqlite3` 不存在
 - 会尝试从旧目录复制历史数据
-  - `~/.akashic/workspace/mcp/feed-mcp/`
-  - `~/.akashic/workspace/backups/feed-plugin-migration-*/feed-mcp/`
+  - `$AKASHIC_WORKSPACE/mcp/feed-mcp/`
+  - `$AKASHIC_WORKSPACE/backups/feed-plugin-migration-*/feed-mcp/`
 - 迁移的是运行态数据，不是把数据打包进仓库

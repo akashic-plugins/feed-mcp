@@ -9,14 +9,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from scripts.path_config import resolve_feed_db
 from src import feed_backend
 
 _TWITTER_EPOCH_MS = 1288834974657
-
-
-def _default_feed_db() -> Path:
-    return Path.home() / ".akashic-plugin" / "data" / "feed-lab" / "feed_mcp.sqlite3"
-
 
 def _published_at_from_status_id(status_id: str) -> str | None:
     if not status_id.isdigit():
@@ -140,10 +136,10 @@ def backfill(feed_db: Path, dry_run: bool) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--feed-db", type=Path, default=_default_feed_db())
+    parser.add_argument("--feed-db", type=Path)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
-    backfill(args.feed_db, args.dry_run)
+    backfill(resolve_feed_db(args.feed_db), args.dry_run)
 
 
 if __name__ == "__main__":

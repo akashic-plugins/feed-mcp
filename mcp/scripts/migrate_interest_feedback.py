@@ -7,13 +7,7 @@ import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
 
-
-def _default_feed_db() -> Path:
-    return Path.home() / ".akashic-plugin" / "data" / "feed-lab" / "feed_mcp.sqlite3"
-
-
-def _default_proactive_db() -> Path:
-    return Path.home() / ".akashic" / "workspace" / "proactive.db"
+from path_config import resolve_feed_db, resolve_workspace_path
 
 
 def _event_id(compound_key: str) -> str:
@@ -109,10 +103,12 @@ def migrate(feed_db: Path, proactive_db: Path) -> tuple[int, int]:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--feed-db", type=Path, default=_default_feed_db())
-    parser.add_argument("--proactive-db", type=Path, default=_default_proactive_db())
+    parser.add_argument("--feed-db", type=Path)
+    parser.add_argument("--proactive-db", type=Path)
     args = parser.parse_args()
-    seen, updated = migrate(args.feed_db, args.proactive_db)
+    feed_db = resolve_feed_db(args.feed_db)
+    proactive_db = resolve_workspace_path(args.proactive_db, "proactive.db")
+    seen, updated = migrate(feed_db, proactive_db)
     print(f"seen={seen} updated={updated}")
 
 

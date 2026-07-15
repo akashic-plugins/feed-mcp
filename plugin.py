@@ -54,8 +54,10 @@ class FeedPlugin(Plugin):
     async def initialize(self) -> None:
         data_dir = self.context.data_dir
         workspace = self.context.workspace
-        if data_dir is None or workspace is None:
-            return
+        if data_dir is None:
+            raise RuntimeError("feed 缺少插件数据目录")
+        if workspace is None:
+            raise RuntimeError("feed 缺少 workspace")
         data_dir.mkdir(parents=True, exist_ok=True)
         if (data_dir / "feed_mcp.sqlite3").exists():
             return

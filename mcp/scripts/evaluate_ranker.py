@@ -10,15 +10,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from scripts.path_config import resolve_feed_db, resolve_workspace_path
 from src import feed_backend
-
-
-def _default_feed_db() -> Path:
-    return Path.home() / ".akashic-plugin" / "data" / "feed-lab" / "feed_mcp.sqlite3"
-
-
-def _default_sessions_db() -> Path:
-    return Path.home() / ".akashic" / "workspace" / "sessions.db"
 
 
 def _precision(labels: list[int], k: int) -> float:
@@ -127,7 +120,7 @@ def evaluate(
     feed_db: Path,
     k: int,
     feedback_db: Path | None,
-    sessions_db: Path,
+    sessions_db: Path | None,
 ) -> None:
     cfg = feed_backend.load_config()
     cfg.db_path = feed_db
@@ -135,6 +128,8 @@ def evaluate(
     try:
         labels = None
         if feedback_db is not None:
+            if sessions_db is None:
+                raise RuntimeError("feedback 评估缺少 sessions.db")
             labels = _labels_from_proactive_feedback(feedback_db, sessions_db)
             where = ""
         else:
@@ -183,12 +178,16 @@ def evaluate(
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--feed-db", type=Path, default=_default_feed_db())
+    parser.add_argument("--feed-db", type=Path)
     parser.add_argument("--feedback-db", type=Path, default=None)
-    parser.add_argument("--sessions-db", type=Path, default=_default_sessions_db())
+    parser.add_argument("--sessions-db", type=Path)
     parser.add_argument("-k", type=int, default=5)
     args = parser.parse_args()
-    evaluate(args.feed_db, args.k, args.feedback_db, args.sessions_db)
+    feed_db = resolve_feed_db(args.feed_db)
+    sessions_db = args.sessions_db
+    if args.feedback_db is not None:
+        sessions_db = resolve_workspace_path(sessions_db, "sessions.db")
+    evaluate(feed_db, args.k, args.feedback_db, sessions_db)
 
 
 if __name__ == "__main__":
