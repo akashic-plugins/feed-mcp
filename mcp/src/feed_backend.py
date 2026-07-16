@@ -132,23 +132,13 @@ def _connect(cfg: FeedMcpConfig) -> sqlite3.Connection:
             first_seen_at TEXT NOT NULL,
             last_seen_at TEXT NOT NULL,
             emitted_at TEXT,
-            content_hash TEXT NOT NULL
+            content_hash TEXT NOT NULL,
+            interest_ok INTEGER,
+            interest_scored_at TEXT
         )
         """
     )
-    columns = {
-        str(row["name"])
-        for row in conn.execute("PRAGMA table_info(items)").fetchall()
-    }
-    if "author" not in columns:
-        conn.execute("ALTER TABLE items ADD COLUMN author TEXT")
-    if "interest_ok" not in columns:
-        conn.execute("ALTER TABLE items ADD COLUMN interest_ok INTEGER")
-    if "interest_scored_at" not in columns:
-        conn.execute("ALTER TABLE items ADD COLUMN interest_scored_at TEXT")
-    for column in ("served_count", "last_served_at", "rank_score", "is_canonical"):
-        if column in columns:
-            conn.execute(f"ALTER TABLE items DROP COLUMN {column}")
+    _migrate_items_schema(conn)
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS metadata (
@@ -227,6 +217,38 @@ def _connect(cfg: FeedMcpConfig) -> sqlite3.Connection:
     _normalize_existing_item_urls(conn)
     _normalize_existing_xcancel_items(conn)
     return conn
+
+
+def _migrate_items_schema(conn: sqlite3.Connection) -> None:
+    """串行迁移 items schema，避免 lifespan 与首个调用重复执行 DDL。"""
+
+    # 1. 获取 SQLite 写锁后再读取列，等待方会看到前一个连接的迁移终态
+    with conn:
+        conn.execute("BEGIN IMMEDIATE")
+        columns = {
+            str(row["name"])
+            for row in conn.execute("PRAGMA table_info(items)").fetchall()
+        }
+
+        # 2. 只迁移旧数据库；全新数据库已由 CREATE TABLE 建立当前 schema
+        additions = {
+            "author": "TEXT",
+            "interest_ok": "INTEGER",
+            "interest_scored_at": "TEXT",
+        }
+        for column, declaration in additions.items():
+            if column not in columns:
+                conn.execute(
+                    f"ALTER TABLE items ADD COLUMN {column} {declaration}"
+                )
+        for column in (
+            "served_count",
+            "last_served_at",
+            "rank_score",
+            "is_canonical",
+        ):
+            if column in columns:
+                conn.execute(f"ALTER TABLE items DROP COLUMN {column}")
 
 
 def _now() -> datetime:
