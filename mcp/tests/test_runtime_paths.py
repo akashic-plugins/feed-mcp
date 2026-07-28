@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -26,15 +25,15 @@ def test_runtime_entrypoints_reject_missing_data_dir(
         load_config()
 
 
-def test_initialize_rejects_missing_context_paths(tmp_path: Path) -> None:
+def test_activate_rejects_missing_context_paths(tmp_path: Path) -> None:
     plugin = FeedPlugin()
     plugin.context = SimpleNamespace(data_dir=None, workspace=tmp_path)
     with pytest.raises(RuntimeError, match="数据目录"):
-        asyncio.run(plugin.initialize())
+        plugin.activate()
 
     plugin.context = SimpleNamespace(data_dir=tmp_path, workspace=None)
     with pytest.raises(RuntimeError, match="workspace"):
-        asyncio.run(plugin.initialize())
+        plugin.activate()
 
 
 def test_concurrent_legacy_connections_share_one_schema_migration(
