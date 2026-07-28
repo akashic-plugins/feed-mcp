@@ -18,6 +18,7 @@ class FeedConfig(BaseModel):
 
 
 class FeedPlugin(Plugin):
+    api_version = 2
     name = "feed"
     version = "1.2.0"
     desc = "Feed MCP plugin"
@@ -51,7 +52,7 @@ class FeedPlugin(Plugin):
             )
         ]
 
-    async def initialize(self) -> None:
+    def activate(self) -> None:
         data_dir = self.context.data_dir
         workspace = self.context.workspace
         if data_dir is None:
