@@ -20,7 +20,7 @@ class FeedConfig(BaseModel):
 class FeedPlugin(Plugin):
     api_version = 2
     name = "feed"
-    version = "1.2.0"
+    version = "1.3.0"
     desc = "Feed MCP plugin"
     ConfigModel = FeedConfig
 

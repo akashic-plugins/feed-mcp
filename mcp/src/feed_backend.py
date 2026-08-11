@@ -1103,7 +1103,8 @@ def feed_query(
     conn = _connect(cfg)
     try:
         trace_id = _trace_id_short()
-        # 1. 查询工具尽量复刻旧逻辑：每次查询前都主动刷新启用源，而不是只看旧缓存。
+        # 1. 只读缓存查询：不主动拉取（拉取由 MCP lifespan 的后台 FeedPoller
+        #    按 poll_ttl_seconds 周期执行，或通过 poll_feeds 显式触发）。
         enabled_rows = conn.execute(
             "SELECT * FROM sources WHERE enabled = 1 ORDER BY added_at DESC"
         ).fetchall()
@@ -1115,16 +1116,7 @@ def feed_query(
             ]
         if not enabled_rows:
             return "没有匹配的启用订阅"
-        summary = _poll_rows(conn, cfg, enabled_rows, force=True, trace_id=trace_id)
-        logger.info(
-            "[feed][trace=%s] feed_query force_poll summary total=%d success=%d failed=%d failed_sources=%s",
-            trace_id,
-            int(summary["total"]),
-            int(summary["success"]),
-            int(summary["failed"]),
-            summary["failed_sources"],
-        )
-        # 2. 刷新完成后再重新做查询，确保 latest/search/catalog 的时效性尽量贴近旧实现。
+        # 2. 直接基于缓存做查询，确保 latest/search/catalog 的时效性贴近缓存 freshness。
         if action == "summary":
             source_names = sorted({str(row["name"]) for row in enabled_rows if row["name"]})
             names = "（无）"
