@@ -20,7 +20,7 @@ class FeedConfig(BaseModel):
 class FeedPlugin(Plugin):
     api_version = 2
     name = "feed"
-    version = "1.3.0"
+    version = "1.3.1"
     desc = "Feed MCP plugin"
     ConfigModel = FeedConfig
 
@@ -34,6 +34,10 @@ class FeedPlugin(Plugin):
             McpServerSpec(
                 name="feed",
                 command=("python", "mcp/run_mcp.py"),
+                candidate_read_only_tools=(
+                    "feed_query",
+                    "get_proactive_events",
+                ),
             )
         ]
 
