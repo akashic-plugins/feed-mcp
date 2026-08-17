@@ -100,8 +100,8 @@ def _connect(cfg: FeedMcpConfig) -> sqlite3.Connection:
     cfg.db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(cfg.db_path, timeout=30)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=30000")
+    conn.execute("PRAGMA journal_mode=WAL")
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS sources (
