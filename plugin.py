@@ -1,12 +1,14 @@
 from __future__ import annotations
 
-import shutil
-from pathlib import Path
-from typing import cast
-
 from pydantic import BaseModel, Field
 
-from agent.plugins import McpServerSpec, Plugin, ProactiveSourceSpec
+from agent.plugin_composition import (
+    MCP_SERVERS,
+    PROACTIVE_COMPONENTS,
+    Context,
+    McpServerDefinition,
+    ProactiveSourceDefinition,
+)
 
 
 class FeedProactiveConfig(BaseModel):
@@ -17,84 +19,43 @@ class FeedConfig(BaseModel):
     proactive: FeedProactiveConfig = Field(default_factory=FeedProactiveConfig)
 
 
-class FeedPlugin(Plugin):
-    api_version = 2
-    name = "feed"
-    version = "1.3.1"
-    desc = "Feed MCP plugin"
-    ConfigModel = FeedConfig
+api_version = 3
+name = "feed"
+version = "3.0.0"
+desc = "Feed MCP plugin"
+Config = FeedConfig
+inject = (MCP_SERVERS, PROACTIVE_COMPONENTS)
+skill_roots = ("skills",)
 
-    @classmethod
-    def skill_roots(cls) -> tuple[str, ...]:
-        return ("skills",)
 
-    @classmethod
-    def mcp_servers(cls) -> list[McpServerSpec]:
-        return [
-            McpServerSpec(
-                name="feed",
-                command=("python", "mcp/run_mcp.py"),
-                candidate_read_only_tools=(
-                    "feed_query",
-                    "get_proactive_events",
-                ),
-            )
-        ]
+async def apply(ctx: Context, config: object) -> None:
+    """注册 Feed MCP 与可选的订阅主动事件源。"""
 
-    def proactive_sources(self) -> list[ProactiveSourceSpec]:
-        config = cast(FeedConfig, self.context.config)
-        if not config.proactive.enabled:
-            return []
-        return [
-            ProactiveSourceSpec(
-                id="subscriptions",
+    if not isinstance(config, FeedConfig):
+        raise TypeError("feed config 必须是 FeedConfig")
+
+    # 1. 只声明 MCP；apply 本身不启动进程、不访问网络或插件数据。
+    await ctx.require(MCP_SERVERS).register(
+        ctx,
+        McpServerDefinition(
+            name="feed",
+            command=("python", "mcp/run_mcp.py"),
+            required_tools=("get_proactive_events", "acknowledge_events"),
+            candidate_read_only_tools=("get_proactive_events",),
+            candidate_env={"FEED_BACKEND": "recording"},
+        ),
+    )
+
+    # 2. 主动能力由用户配置决定是否发布。
+    if config.proactive.enabled:
+        await ctx.require(PROACTIVE_COMPONENTS).register(
+            ctx,
+            ProactiveSourceDefinition(
+                name="subscriptions",
                 channels=("content",),
-                server="feed",
+                mcp_server="feed",
                 fetch_tool="get_proactive_events",
                 ack_tool="acknowledge_events",
                 fetch_page_size=50,
-            )
-        ]
-
-    def activate(self) -> None:
-        data_dir = self.context.data_dir
-        workspace = self.context.workspace
-        if data_dir is None:
-            raise RuntimeError("feed 缺少插件数据目录")
-        if workspace is None:
-            raise RuntimeError("feed 缺少 workspace")
-        data_dir.mkdir(parents=True, exist_ok=True)
-        if (data_dir / "feed_mcp.sqlite3").exists():
-            return
-        for source_dir in _legacy_feed_dirs(workspace):
-            copied = _copy_legacy_state(source_dir, data_dir)
-            if copied:
-                return
-
-
-def _legacy_feed_dirs(workspace: Path) -> list[Path]:
-    result: list[Path] = []
-    primary = workspace / "mcp" / "feed-mcp"
-    if primary.exists():
-        result.append(primary)
-    backups_root = workspace / "backups"
-    if backups_root.exists():
-        result.extend(
-            sorted(
-                backups_root.glob("feed-plugin-migration-*/feed-mcp"),
-                reverse=True,
-            )
+            ),
         )
-    return result
-
-
-def _copy_legacy_state(source_dir: Path, data_dir: Path) -> bool:
-    copied = False
-    for name in ("feed_mcp.sqlite3", "source_scores.json", "feed_cache.db"):
-        source = source_dir / name
-        target = data_dir / name
-        if not source.exists() or target.exists():
-            continue
-        shutil.copy2(source, target)
-        copied = True
-    return copied

@@ -1,0 +1,27 @@
+schema_version = 1
+name = "feed"
+version = "3.0.0"
+api_version = 3
+entrypoint = "plugin.py"
+
+[[python]]
+requirements = "mcp/requirements.txt"
+
+[validation]
+exclude_data_paths = [
+  "feed_mcp.sqlite3",
+  "feed_mcp.sqlite3-wal",
+  "feed_mcp.sqlite3-shm",
+  "source_scores.json",
+  "feed_cache.db",
+  "feed_cache.db-wal",
+  "feed_cache.db-shm",
+  ".feed-v2-migration.json",
+]
+
+[[mcp]]
+name = "feed"
+command = ["python", "mcp/run_mcp.py"]
+required_tools = ["get_proactive_events", "acknowledge_events"]
+candidate_read_only_tools = ["get_proactive_events"]
+candidate_env = {FEED_BACKEND = "recording"}

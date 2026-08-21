@@ -100,8 +100,8 @@ def _connect(cfg: FeedMcpConfig) -> sqlite3.Connection:
     cfg.db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(cfg.db_path, timeout=30)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=30000")
+    conn.execute("PRAGMA journal_mode=WAL")
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS sources (
@@ -1018,75 +1018,6 @@ def feed_manage(action: str, name: str = "", url: str = "", source_type: str = "
             conn.commit()
             return f"已订阅 {name.strip()!r}（类型={source_type or 'rss'} {normalized_url}），下次主动巡检时开始收集"
         return "错误：action 必须是 subscribe|list|unsubscribe"
-    finally:
-        conn.close()
-
-
-def sync_legacy_subscriptions(json_path: str) -> dict[str, int]:
-    cfg = load_config()
-    conn = _connect(cfg)
-    inserted = 0
-    updated = 0
-    try:
-        # 1. 从旧 feeds.json 读取订阅列表，兼容历史本地 feed 配置。
-        path = Path(json_path).expanduser()
-        if not path.exists():
-            return {"inserted": 0, "updated": 0}
-        raw = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(raw, list):
-            return {"inserted": 0, "updated": 0}
-        # 2. 按 URL 对齐到 feed-mcp 的 sources 表，避免迁移时重复插入。
-        for item in raw:
-            if not isinstance(item, dict):
-                continue
-            name = str(item.get("name") or "").strip()
-            url = _normalize_source_url(str(item.get("url") or "").strip())
-            if not name or not url:
-                continue
-            row = conn.execute(
-                "SELECT id FROM sources WHERE url = ? LIMIT 1",
-                (url,),
-            ).fetchone()
-            payload = (
-                str(item.get("type") or "rss"),
-                name,
-                url,
-                str(item.get("note") or "").strip() or None,
-                1 if bool(item.get("enabled", True)) else 0,
-                cfg.poll_ttl_seconds,
-                str(item.get("added_at") or _now().isoformat()),
-                _now().isoformat(),
-            )
-            if row is None:
-                source_id = str(item.get("id") or uuid.uuid4())
-                conn.execute(
-                    """
-                    INSERT INTO sources (id, type, name, url, note, enabled, poll_interval_seconds, added_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (source_id, *payload),
-                )
-                inserted += 1
-                continue
-            conn.execute(
-                """
-                UPDATE sources
-                SET type = ?, name = ?, note = ?, enabled = ?, poll_interval_seconds = ?, updated_at = ?
-                WHERE id = ?
-                """,
-                (
-                    payload[0],
-                    payload[1],
-                    payload[3],
-                    payload[4],
-                    payload[5],
-                    payload[7],
-                    str(row["id"]),
-                ),
-            )
-            updated += 1
-        conn.commit()
-        return {"inserted": inserted, "updated": updated}
     finally:
         conn.close()
 

@@ -1,79 +1,71 @@
 # feed-mcp
 
-`feed-mcp` 是一个 Aka 插件试点仓库，打包了三类能力：
+Feed 是一个 Akashic Plugin API v3 插件，提供 RSS 订阅管理、Feed MCP 和
+`subscriptions` 主动内容源，同时保留 `skills/` 下的 Feed 技能。
 
-- `lifecycle`: 最小 `FeedPlugin`
-- `skills`: `feed-manage` 与 `rsshub-route-finder`
-- `mcp`: feed 订阅查询、缓存自刷新与主动事件读取
-
-查询语义（1.3.0 起）：`feed_query` 只读缓存，不主动触发拉取；缓存 freshness 由 MCP lifespan 的后台 `FeedPoller` 按 `poll_ttl_seconds`（默认 300s）周期刷新，或通过 `poll_feeds` 显式触发。
+`feed_query` 只读缓存，不主动触发拉取；缓存 freshness 由 MCP lifespan 的后台
+`FeedPoller` 按 `poll_ttl_seconds`（默认 300s）周期刷新，或通过 `poll_feeds`
+显式触发。
 
 目录结构：
 
 ```text
 feed-mcp
+├─ akashic.plugin.toml
 ├─ plugin.py
+├─ scripts/migrate_v2_data.py
 ├─ skills/
-│  ├─ feed-manage/
-│  └─ rsshub-route-finder/
 └─ mcp/
    ├─ run_mcp.py
    └─ src/
 ```
 
-本仓库用于验证：
+`plugin.py` 只执行 `apply(ctx, config)` 声明，不启动进程、不访问网络、不读写
+插件数据。Core 从静态 manifest 准备 MCP runtime，并按配置注册
+`subscriptions` 主动事件源；`skill_roots = ("skills",)` 保持原有技能装载路径。
 
-- `plugin.py` 程序化声明生命周期、skills、MCP 与主动信息源
-- `~/.akashic-plugin/cache` 下的 installed plugin 装载
-- skill 软链接
-- 插件程序化 MCP 注册
+正式运行数据位于 Core 分配的 `plugin-data/feed-<marketplace>/`：
 
-运行时目录：
+- `feed_mcp.sqlite3`：订阅、条目、确认和轮询状态
+- `source_scores.json`、`feed_cache.db`：v2 历史运行数据（如存在）
+- 运行日志只通过 MCP stderr 输出，不创建 `feed_mcp.runtime.log`
 
-```text
-~/.akashic-plugin
-├─ cache/
-│  └─ <marketplace>/feed/<version>/
-│     ├─ plugin.py
-│     ├─ skills/
-│     └─ mcp/
-└─ data/
-   └─ feed-<marketplace>/
-      ├─ feed_mcp.sqlite3
-      ├─ source_scores.json
-      ├─ feed_cache.db
-      ├─ feed_mcp.runtime.log
-      ├─ feed_mcp.runtime.log.1
-      ├─ feed_mcp.runtime.log.2
-      └─ feed_mcp.runtime.log.3
+候选验证使用 `FEED_BACKEND=recording`：
+
+- `get_proactive_events` 固定返回 `{"status":"empty"}`
+- 不启动 `FeedPoller`，不访问 RSS/RSSHub、不连接 SQLite
+- `acknowledge_events` 在 recording 后端 fail-loud
+- candidate 只开放只读的 `get_proactive_events`
+
+正式主动端口使用明确的 typed 结果：拉取返回 `empty` 或 `items`，确认只有全部
+请求 ID 持久成功时才返回 `committed`；异常和部分确认返回 `failure`，不会伪装
+为成功。
+
+## 从 v2 迁移
+
+先停止占用 workspace 的 Akashic runtime，再运行：
+
+```bash
+PYTHONPATH=/path/to/akashic-agent \
+python scripts/migrate_v2_data.py \
+  --workspace /path/to/workspace \
+  --marketplace github
 ```
 
-边界约定：
+迁移脚本持有 workspace 独占锁，按 `mcp/feed-mcp/` primary、再按
+`backups/feed-plugin-migration-*/feed-mcp/` 最新备份顺序选择第一个含数据的源，
+并保留源目录。`feed_mcp.sqlite3` 和其他 SQLite 数据使用在线 backup 后执行
+integrity check；目标存在不同内容时直接失败。
 
-- `cache` 只放代码包与依赖环境，可被新版本替换
-- `data` 只放运行时状态与历史数据，升级时保留
-- 仓库本身不提交 sqlite、日志、运行态缓存
-- 运行日志按 5MB 轮转，最多保留 3 个历史文件
+最终 receipt 写入
+`plugin-data/feed-<marketplace>/.feed-v2-migration.json`，逐文件记录
+`source_missing`、`target_only`、`verified` 或 `copied`、源路径、SHA-256、大小和
+SQLite integrity。进程内发布失败会回滚本次新增文件；进程崩溃后重跑会清理残留
+staging、核对同内容目标并完成发布。源数据保留作为 recovery source；receipt
+不属于候选验证输入。
 
-当前 feed 的持久化方式：
-
-- 新增/取消订阅通过 `feed_manage` 直接读写 sqlite `sources`
-- 历史内容保存在 sqlite `items`
-- 主动推送确认状态保存在 sqlite `acked_items`
-- 轮询状态保存在 sqlite `poll_state`
-
-缓存 freshness：
-
-- MCP 进程通过 FastMCP lifespan 启动唯一后台 poller
-- 启动后立即刷新一次；首次主动事件读取会等待该刷新完成
-- 后续按 `feed_mcp.json` 的 `poll_ttl_seconds` 定时刷新
-- `get_proactive_events` 只读取稳定缓存，不承担网络抓取
-- SQLite 使用 WAL 和 busy timeout，轮询写入不会阻塞缓存快照读取
-
-首次迁移行为：
-
-- 插件首次启动时，如果 `$AKA_PLUGIN_DATA_DIR/feed_mcp.sqlite3` 不存在
-- 会尝试从旧目录复制历史数据
-  - `$AKASHIC_WORKSPACE/mcp/feed-mcp/`
-  - `$AKASHIC_WORKSPACE/backups/feed-plugin-migration-*/feed-mcp/`
-- 迁移的是运行态数据，不是把数据打包进仓库
+完整外网 RSS E2E 不属于本插件工作流。v3 workflow 固定 Core
+`78e50d4dfb3f4348fff37d55d9c9bdd0e002164d` 与 contracts
+`4dd69dd621e029e51e99aa428443fa3a4ec1f6cf`，执行插件单元测试、pyright、
+`compileall` 和 `git diff --check`，并以空订阅库走真实 Manager、stdio MCP、
+committed proactive source lease 与 terminate cleanup。
