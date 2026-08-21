@@ -3,6 +3,12 @@
 Feed 是一个 Akashic Plugin API v3 插件，提供 RSS 订阅管理、Feed MCP 和
 `subscriptions` 主动内容源，同时保留 `skills/` 下的 Feed 技能。
 
+`feed_query` 只读缓存，不主动触发拉取；缓存 freshness 由 MCP lifespan 的后台
+`FeedPoller` 按 `poll_ttl_seconds`（默认 300s）周期刷新，或通过 `poll_feeds`
+显式触发。
+
+目录结构：
+
 ```text
 feed-mcp
 ├─ akashic.plugin.toml
