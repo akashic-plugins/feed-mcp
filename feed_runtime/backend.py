@@ -75,15 +75,31 @@ def _runtime_root(data_root: Path | None = None) -> Path:
     return path
 
 
-def load_config(data_root: Path | None = None) -> FeedMcpConfig:
-    runtime_root = _runtime_root(data_root)
+def _config_values() -> dict[str, Any]:
     raw = dict(_DEFAULT_CONFIG)
     path = _config_path()
     if path.exists():
         raw.update(json.loads(path.read_text()))
+    return raw
+
+
+def _database_path(data_root: Path, raw: dict[str, Any]) -> Path:
     db_path = Path(str(raw["db_path"]))
     if not db_path.is_absolute():
-        db_path = (runtime_root / db_path).resolve()
+        db_path = (data_root.expanduser() / db_path).resolve()
+    return db_path
+
+
+def provider_database_path(data_root: Path) -> Path:
+    """Resolve the configured Feed database without creating runtime state."""
+
+    return _database_path(data_root, _config_values())
+
+
+def load_config(data_root: Path | None = None) -> FeedMcpConfig:
+    runtime_root = _runtime_root(data_root)
+    raw = _config_values()
+    db_path = _database_path(runtime_root, raw)
     return FeedMcpConfig(
         db_path=db_path,
         poll_ttl_seconds=max(60, int(raw["poll_ttl_seconds"])),

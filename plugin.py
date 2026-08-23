@@ -12,7 +12,7 @@ from agent.plugin_composition import (
     ServiceKey,
 )
 
-from content_source import ContentSourceServices, FeedContentRuntime
+from content_source import CONTENT_SOURCE_ID, ContentSourceServices, FeedContentRuntime
 
 
 class FeedConfig(BaseModel):
@@ -52,7 +52,7 @@ async def apply(ctx: Context, config: object) -> None:
     runtime = FeedContentRuntime(
         ctx.data_root,
         ctx.require(TIMERS),
-        ctx.require(CONTENT_SOURCE).bind("feed-subscriptions"),
+        ctx.require(CONTENT_SOURCE).bind(CONTENT_SOURCE_ID),
     )
 
     def setup() -> object:

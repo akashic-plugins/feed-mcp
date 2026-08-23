@@ -16,6 +16,9 @@ from agent.plugin_composition import PluginTimers
 from feed_runtime import backend
 
 
+CONTENT_SOURCE_ID = "feed-subscriptions"
+
+
 class BoundContentSource(Protocol):
     def submit(
         self, batch_id: str, items: Sequence[Mapping[str, object]]
