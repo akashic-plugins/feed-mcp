@@ -8,8 +8,8 @@ import pytest
 
 import plugin
 from run_mcp import _runtime_dir
-from src import feed_backend
-from src.feed_backend import _runtime_root, load_config
+from feed_runtime import backend as feed_backend
+from feed_runtime.backend import _config_path, _runtime_root, load_config
 
 
 def test_runtime_entrypoints_reject_missing_data_dir(
@@ -27,8 +27,9 @@ def test_runtime_entrypoints_reject_missing_data_dir(
 def test_v3_module_keeps_skill_root_and_identity_exports() -> None:
     assert plugin.api_version == 3
     assert plugin.name == "feed"
-    assert plugin.version == "3.0.0"
+    assert plugin.version == "3.1.0"
     assert plugin.skill_roots == ("skills",)
+    assert _config_path() == Path(__file__).resolve().parents[1] / "feed_mcp.json"
 
 
 def test_concurrent_legacy_connections_share_one_schema_migration(

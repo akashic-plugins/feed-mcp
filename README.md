@@ -1,71 +1,55 @@
 # feed-mcp
 
-Feed 是一个 Akashic Plugin API v3 插件，提供 RSS 订阅管理、Feed MCP 和
-`subscriptions` 主动内容源，同时保留 `skills/` 下的 Feed 技能。
+Feed 是一个 Akashic Plugin API v3 插件。它用现有的三个正交能力组合出完整
+Feed 链路：
 
-`feed_query` 只读缓存，不主动触发拉取；缓存 freshness 由 MCP lifespan 的后台
-`FeedPoller` 按 `poll_ttl_seconds`（默认 300s）周期刷新，或通过 `poll_feeds`
-显式触发。
+```text
+Core Timer ──触发──> Feed source ──submit──> Content inbox
+                         │                         │
+                         └──精确 revision ACK <───┘
 
-目录结构：
+用户 Turn ──调用──> Feed MCP ──只做──> 订阅管理 / 缓存查询
+```
+
+## 能力与 owner
+
+- `MCP_SERVERS`：只注册用户主动调用的 `feed_manage`、`feed_query`。MCP
+  lifespan 不启动后台轮询，也没有主动内容专用工具。
+- `TIMERS`：正式稳定 Root 拥有唯一轮询 Timer。每次只注册一个 one-shot
+  deadline；完成 settlement、拉取、提交和 deadline 持久化后再注册下一次。
+- `content.source.v1`：以 `feed-subscriptions` 身份提交完整 Feed item，并接收
+  Content 的 delivery settlement。ACK 精确绑定 `event_id + content_hash`；旧
+  revision 的 ACK 不会误确认新内容。
+
+Feed 的 SQLite 是 provider 事实 owner：订阅、完整 item、当前 poll state、ACK
+和每个已导出 revision 的冻结 payload 都留在 `feed_mcp.sqlite3`。Content 是待处理
+与投递状态 owner。纯诊断日志固定为 5 MiB、最多 3 个备份；空轮询只更新当前
+deadline，不提交 Content，也不制造持久内容历史。
+
+候选版本允许自己的 MCP managed-process 完成 readiness/handshake，但
+`candidate_read_only_tools = []`，且 recording backend 不接触 Feed 数据。候选 Root
+不会收到 `runtime.started`，因此不会注册 Timer、访问外部 Feed 或写正式数据库。
+
+## 目录
 
 ```text
 feed-mcp
 ├─ akashic.plugin.toml
-├─ plugin.py
-├─ scripts/migrate_v2_data.py
+├─ plugin.py                 # 组合 MCP、Timer、Content source
+├─ content_source.py         # Feed source 私有生命周期
+├─ feed_runtime/backend.py   # MCP 与 source 共享的唯一 Feed domain 实现
 ├─ skills/
 └─ mcp/
    ├─ run_mcp.py
-   └─ src/
+   └─ src/mcp_bridge.py      # 薄 MCP adapter
 ```
 
-`plugin.py` 只执行 `apply(ctx, config)` 声明，不启动进程、不访问网络、不读写
-插件数据。Core 从静态 manifest 准备 MCP runtime，并按配置注册
-`subscriptions` 主动事件源；`skill_roots = ("skills",)` 保持原有技能装载路径。
+正式数据由 Core 分配到 `plugin-data/feed-<marketplace>/`。从 v2 迁移仍使用
+`scripts/migrate_v2_data.py`；它保留源数据并产生可核对的 migration receipt。
 
-正式运行数据位于 Core 分配的 `plugin-data/feed-<marketplace>/`：
+## 验证
 
-- `feed_mcp.sqlite3`：订阅、条目、确认和轮询状态
-- `source_scores.json`、`feed_cache.db`：v2 历史运行数据（如存在）
-- 运行日志只通过 MCP stderr 输出，不创建 `feed_mcp.runtime.log`
-
-候选验证使用 `FEED_BACKEND=recording`：
-
-- `get_proactive_events` 固定返回 `{"status":"empty"}`
-- 不启动 `FeedPoller`，不访问 RSS/RSSHub、不连接 SQLite
-- `acknowledge_events` 在 recording 后端 fail-loud
-- candidate 只开放只读的 `get_proactive_events`
-
-正式主动端口使用明确的 typed 结果：拉取返回 `empty` 或 `items`，确认只有全部
-请求 ID 持久成功时才返回 `committed`；异常和部分确认返回 `failure`，不会伪装
-为成功。
-
-## 从 v2 迁移
-
-先停止占用 workspace 的 Akashic runtime，再运行：
-
-```bash
-PYTHONPATH=/path/to/akashic-agent \
-python scripts/migrate_v2_data.py \
-  --workspace /path/to/workspace \
-  --marketplace github
-```
-
-迁移脚本持有 workspace 独占锁，按 `mcp/feed-mcp/` primary、再按
-`backups/feed-plugin-migration-*/feed-mcp/` 最新备份顺序选择第一个含数据的源，
-并保留源目录。`feed_mcp.sqlite3` 和其他 SQLite 数据使用在线 backup 后执行
-integrity check；目标存在不同内容时直接失败。
-
-最终 receipt 写入
-`plugin-data/feed-<marketplace>/.feed-v2-migration.json`，逐文件记录
-`source_missing`、`target_only`、`verified` 或 `copied`、源路径、SHA-256、大小和
-SQLite integrity。进程内发布失败会回滚本次新增文件；进程崩溃后重跑会清理残留
-staging、核对同内容目标并完成发布。源数据保留作为 recovery source；receipt
-不属于候选验证输入。
-
-完整外网 RSS E2E 不属于本插件工作流。v3 workflow 固定 Core
-`78e50d4dfb3f4348fff37d55d9c9bdd0e002164d` 与 contracts
-`4dd69dd621e029e51e99aa428443fa3a4ec1f6cf`，执行插件单元测试、pyright、
-`compileall` 和 `git diff --check`，并以空订阅库走真实 Manager、stdio MCP、
-committed proactive source lease 与 terminate cleanup。
+CI 固定 Core `9da3a988a2bf62b0f550bd4f6bb98c4eeb1f56f5`，运行单元测试、真实
+Manager + stdio MCP + Content + Timer fixture、pyright、compileall 和
+`git diff --check`。Manager fixture 还证明：候选零 Timer/零正式写，发布时旧
+Timer 已取消后新稳定 Root 才接班。

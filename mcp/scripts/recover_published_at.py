@@ -16,8 +16,9 @@ import feedparser
 import requests
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from src import feed_backend
+from feed_runtime import backend as feed_backend
 
 
 _ARXIV_ID_RE = re.compile(r"^(?:[a-z0-9._-]+/\d{7}|\d{4}\.\d{4,5})(?:v\d+)?$", re.I)

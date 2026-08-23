@@ -8,10 +8,11 @@ from datetime import timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.evaluate_ranker import _labels_from_proactive_feedback
 from scripts.path_config import resolve_feed_db, resolve_workspace_path
-from src import feed_backend
+from feed_runtime import backend as feed_backend
 
 
 def _label(event_id: str, fallback_labels: dict[str, int], feedback_labels: dict[str, int] | None) -> int | None:

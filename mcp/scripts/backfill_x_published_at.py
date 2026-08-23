@@ -8,9 +8,10 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.path_config import resolve_feed_db
-from src import feed_backend
+from feed_runtime import backend as feed_backend
 
 _TWITTER_EPOCH_MS = 1288834974657
 

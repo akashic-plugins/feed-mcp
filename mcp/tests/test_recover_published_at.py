@@ -9,7 +9,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from scripts import recover_published_at
-from src import feed_backend
+from feed_runtime import backend as feed_backend
 
 
 class _Response:

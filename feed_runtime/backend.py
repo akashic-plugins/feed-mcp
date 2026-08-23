@@ -1,10 +1,10 @@
 """
-feed-mcp backend
+Feed domain backend shared by the MCP adapter and Content source runtime.
 
 最小实现：
 1. 用 sqlite 管理订阅源和条目
 2. 按需轮询 RSS/Atom
-3. 对外提供 proactive content 事件与基础管理查询能力
+3. 对外提供 Content 条目与基础管理查询能力
 """
 
 from __future__ import annotations
@@ -60,20 +60,23 @@ class FeedMcpConfig:
 
 
 def _config_path() -> Path:
-    return Path(__file__).resolve().parent.parent / "feed_mcp.json"
+    return Path(__file__).resolve().parent.parent / "mcp" / "feed_mcp.json"
 
 
-def _runtime_root() -> Path:
-    raw = os.environ.get("AKA_PLUGIN_DATA_DIR", "").strip()
-    if not raw:
-        raise RuntimeError("feed backend 缺少 AKA_PLUGIN_DATA_DIR")
-    path = Path(raw).expanduser()
+def _runtime_root(data_root: Path | None = None) -> Path:
+    if data_root is None:
+        raw = os.environ.get("AKA_PLUGIN_DATA_DIR", "").strip()
+        if not raw:
+            raise RuntimeError("feed backend 缺少 AKA_PLUGIN_DATA_DIR")
+        path = Path(raw).expanduser()
+    else:
+        path = data_root.expanduser()
     path.mkdir(parents=True, exist_ok=True)
     return path
 
 
-def load_config() -> FeedMcpConfig:
-    runtime_root = _runtime_root()
+def load_config(data_root: Path | None = None) -> FeedMcpConfig:
+    runtime_root = _runtime_root(data_root)
     raw = dict(_DEFAULT_CONFIG)
     path = _config_path()
     if path.exists():
@@ -208,6 +211,17 @@ def _connect(cfg: FeedMcpConfig) -> sqlite3.Connection:
             error REAL NOT NULL,
             feature_count INTEGER NOT NULL,
             updated_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS content_exports (
+            event_id TEXT NOT NULL,
+            content_hash TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY(event_id, content_hash)
         )
         """
     )
@@ -1034,8 +1048,7 @@ def feed_query(
     conn = _connect(cfg)
     try:
         trace_id = _trace_id_short()
-        # 1. 只读缓存查询：不主动拉取（拉取由 MCP lifespan 的后台 FeedPoller
-        #    按 poll_ttl_seconds 周期执行，或通过 poll_feeds 显式触发）。
+        # 1. 只读缓存查询：不主动拉取（拉取由插件 Timer 统一触发）。
         enabled_rows = conn.execute(
             "SELECT * FROM sources WHERE enabled = 1 ORDER BY added_at DESC"
         ).fetchall()
@@ -1168,10 +1181,10 @@ def feed_query(
 
 
 def _build_display_text(row: sqlite3.Row) -> str:
-    """为单条 item 生成预格式化展示文本，供 proactive LLM 直接使用。
+    """为单条 item 生成稳定展示文本，供 Content 消费方直接使用。
 
-    MCP 侧控制格式，proactive 侧无需感知内容类型细节。
-    url 同时保留在独立字段，proactive 会兜底追加以保证溯源链完整。
+    Feed 侧控制格式，消费方无需感知内容类型细节。
+    url 同时保留在独立字段，保证溯源链完整。
     """
     source = (row["source_name"] or "").strip()
     title = (row["title"] or "（无标题）").strip()
@@ -1195,7 +1208,7 @@ _RECENT_CONTEXT_LIMIT = 100
 _SOURCE_DIVERSITY_DECAY = 0.5
 _SOURCE_DIVERSITY_FLOOR = 0.05
 _MISSING_PUBLICATION_CONFIDENCE = 0.03
-_WAKE_ADMISSION_FLOOR = 0.02
+_CONTENT_ADMISSION_FLOOR = 0.02
 
 
 def _tokenize_rank_text(*parts: object) -> list[str]:
@@ -1395,7 +1408,7 @@ def _freshness_score(row: sqlite3.Row, cfg: FeedMcpConfig, now: datetime) -> tup
     )
 
 
-def _wake_admission_score(features: dict[str, float]) -> float:
+def _content_admission_score(features: dict[str, float]) -> float:
     interest = min(0.999, max(0.0, float(features.get("interest", 0.0))))
     freshness = min(1.0, max(0.0, float(features.get("freshness", 0.0))))
     return -math.log1p(-interest) * freshness
@@ -1758,13 +1771,10 @@ def _record_rank_impressions(
         )
 
 
-def poll_feeds_only() -> None:
-    """按需轮询所有启用源（尊重 poll_ttl_seconds），不返回内容。
-    由 MCP lifespan 按固定周期调用，与 get_proactive_events 完全解耦。
-    单源失败已在 _poll_rows 内部隔离；系统级异常（DB 不可用、配置损坏等）直接上抛，
-    由调用方决定如何处理，避免故障被静默吞掉。
-    """
-    cfg = load_config()
+def poll_feeds_only(*, data_root: Path | None = None) -> None:
+    """Poll every due Feed source once and preserve per-source outcomes."""
+
+    cfg = load_config(data_root)
     conn = _connect(cfg)
     try:
         trace_id = _trace_id_short()
@@ -1786,11 +1796,13 @@ def poll_feeds_only() -> None:
         conn.close()
 
 
-def get_proactive_events(*, offset: int = 0, limit: int = 50) -> list[dict[str, Any]]:
-    cfg = load_config()
+def prepare_content_items(*, data_root: Path) -> tuple[dict[str, object], ...]:
+    """Freeze complete current revisions for idempotent Content submission."""
+
+    cfg = load_config(data_root)
     conn = _connect(cfg)
     try:
-        # 纯 DB 查询，不触发轮询。MCP lifespan 独立维护缓存 freshness。
+        # 1. Rank every current unacknowledged item.
         now = _now()
         rows = conn.execute(
             """
@@ -1804,7 +1816,8 @@ def get_proactive_events(*, offset: int = 0, limit: int = 50) -> list[dict[str, 
                 i.url,
                 i.author,
                 i.published_at,
-                i.first_seen_at
+                i.first_seen_at,
+                i.content_hash
             FROM items i
             LEFT JOIN acked_items a ON a.event_id = i.event_id
             WHERE a.event_id IS NULL
@@ -1819,97 +1832,139 @@ def get_proactive_events(*, offset: int = 0, limit: int = 50) -> list[dict[str, 
         admitted = []
         for row in rows:
             score, features = ranked_by_id.get(str(row["event_id"]), (0.0, {}))
-            admission_score = _wake_admission_score(features)
-            if admission_score < _WAKE_ADMISSION_FLOOR:
+            admission_score = _content_admission_score(features)
+            if admission_score < _CONTENT_ADMISSION_FLOOR:
                 continue
             visible_features = dict(features)
-            visible_features["wake_admission_score"] = admission_score
+            visible_features["content_admission_score"] = admission_score
             admitted.append((row, score, visible_features))
-        selected = admitted[max(0, offset):max(0, offset) + max(1, limit)]
-        return [
-            {
-                "event_id": row["event_id"],
+
+        # 2. Freeze one complete payload for each exact content revision.
+        prepared: list[dict[str, object]] = []
+        for row, score, features in admitted:
+            event_id = str(row["event_id"])
+            revision = str(row["content_hash"])
+            payload = {
                 "kind": "content",
                 "source_type": row["source_type"],
                 "source_id": row["source_id"],
                 "source_name": row["source_name"],
                 "title": row["title"],
+                "content": row["content"],
                 "url": row["url"],
+                "author": row["author"],
                 "published_at": row["published_at"],
                 "first_seen_at": row["first_seen_at"],
                 "preprocess_score": round(score, 6),
                 "preprocess_features": features,
             }
-            for row, score, features in selected
-        ]
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO content_exports(
+                    event_id, content_hash, payload_json, created_at
+                ) VALUES (?, ?, ?, ?)
+                """,
+                (
+                    event_id,
+                    revision,
+                    json.dumps(payload, sort_keys=True, separators=(",", ":")),
+                    now.isoformat(),
+                ),
+            )
+            frozen = conn.execute(
+                """
+                SELECT payload_json FROM content_exports
+                WHERE event_id = ? AND content_hash = ?
+                """,
+                (event_id, revision),
+            ).fetchone()
+            if frozen is None:
+                raise RuntimeError("Feed Content export 冻结失败")
+            frozen_payload = json.loads(str(frozen["payload_json"]))
+            prepared.append(
+                {
+                    "item_id": event_id,
+                    "revision": revision,
+                    "payload": frozen_payload,
+                    "not_before": str(
+                        frozen_payload.get("published_at")
+                        or frozen_payload["first_seen_at"]
+                    ),
+                    "requires_ack": True,
+                }
+            )
+        conn.commit()
+        return tuple(prepared)
     finally:
         conn.close()
 
 
-def _interest_ok_from_feedback(feedback: str | None) -> int | None:
-    if feedback is None or feedback == "consumed":
-        return None
-    if feedback == "interesting":
-        return 1
-    if feedback == "not_interesting":
-        return 0
-    raise ValueError(f"invalid feedback: {feedback}")
+def settle_content_item(
+    event_id: str,
+    revision: str,
+    *,
+    data_root: Path,
+) -> dict[str, str]:
+    """Ensure one exact exported revision is no longer pending in Feed."""
 
-
-def acknowledge_events(
-    event_ids: list[str],
-    feedback: str | None = None,
-) -> dict[str, list[str]]:
-    cfg = load_config()
+    cfg = load_config(data_root)
     conn = _connect(cfg)
     now = _now()
-    acked: list[str] = []
-    failed: list[str] = []
     try:
-        interest_ok = _interest_ok_from_feedback(feedback)
-        for event_id in event_ids:
-            try:
-                conn.execute(
-                    """
-                    INSERT INTO acked_items (event_id, acked_at, expires_at)
-                    VALUES (?, ?, ?)
-                    ON CONFLICT(event_id) DO UPDATE SET
-                        acked_at=excluded.acked_at,
-                        expires_at=excluded.expires_at
-                    """,
-                    (
-                        event_id,
-                        now.isoformat(),
-                        (now + timedelta(hours=cfg.item_retention_hours)).isoformat(),
-                    ),
-                )
-                if interest_ok is not None:
-                    conn.execute(
-                        """
-                        UPDATE items
-                        SET interest_ok = ?, interest_scored_at = ?
-                        WHERE event_id = ?
-                        """,
-                        (interest_ok, now.isoformat(), event_id),
-                    )
-                row = conn.execute(
-                    """
-                    SELECT
-                        event_id, source_id, source_name, author, title, content, published_at,
-                        first_seen_at, interest_ok, interest_scored_at
-                    FROM items
-                    WHERE event_id = ?
-                    """,
-                    (event_id,),
-                ).fetchone()
-                if row is not None and interest_ok is not None:
-                    _update_rank_stats_for_row(conn, row, interest_ok, now.isoformat())
-                    _update_rank_model_for_row(conn, cfg, row, interest_ok, now.isoformat())
-                acked.append(event_id)
-            except Exception:
-                logger.exception("feed ack failed: %s", event_id)
-                failed.append(event_id)
+        current = conn.execute(
+            "SELECT content_hash FROM items WHERE event_id = ?", (event_id,)
+        ).fetchone()
+        if current is None:
+            return {"status": "committed", "disposition": "not_pending"}
+        if str(current["content_hash"]) != revision:
+            return {"status": "committed", "disposition": "obsolete_revision"}
+        conn.execute(
+            """
+            INSERT INTO acked_items (event_id, acked_at, expires_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(event_id) DO UPDATE SET
+                acked_at=excluded.acked_at,
+                expires_at=excluded.expires_at
+            """,
+            (
+                event_id,
+                now.isoformat(),
+                (now + timedelta(hours=cfg.item_retention_hours)).isoformat(),
+            ),
+        )
         conn.commit()
-        return {"acknowledged": acked, "failed": failed}
+        return {"status": "committed", "disposition": "acknowledged"}
+    finally:
+        conn.close()
+
+
+def content_source_deadline(*, data_root: Path, now: datetime) -> datetime:
+    """Return the durable next source deadline, defaulting to immediate work."""
+
+    cfg = load_config(data_root)
+    conn = _connect(cfg)
+    try:
+        row = conn.execute(
+            "SELECT value FROM metadata WHERE key = 'content_source_next_due'"
+        ).fetchone()
+        return now if row is None else datetime.fromisoformat(str(row["value"]))
+    finally:
+        conn.close()
+
+
+def commit_content_source_deadline(*, data_root: Path, deadline: datetime) -> None:
+    """Commit the next source-owned deadline without appending poll history."""
+
+    cfg = load_config(data_root)
+    conn = _connect(cfg)
+    try:
+        conn.execute(
+            """
+            INSERT INTO metadata(key, value) VALUES('content_source_next_due', ?)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value
+            """,
+            (deadline.isoformat(),),
+        )
+        conn.commit()
     finally:
         conn.close()

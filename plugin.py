@@ -1,61 +1,63 @@
 from __future__ import annotations
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 from agent.plugin_composition import (
     MCP_SERVERS,
-    PROACTIVE_COMPONENTS,
+    RUNTIME_STARTED,
+    RUNTIME_STOPPING,
+    TIMERS,
     Context,
     McpServerDefinition,
-    ProactiveSourceDefinition,
+    ServiceKey,
 )
 
-
-class FeedProactiveConfig(BaseModel):
-    enabled: bool = True
+from content_source import ContentSourceServices, FeedContentRuntime
 
 
 class FeedConfig(BaseModel):
-    proactive: FeedProactiveConfig = Field(default_factory=FeedProactiveConfig)
+    pass
 
+
+CONTENT_SOURCE = ServiceKey[ContentSourceServices]("content.source.v1")
 
 api_version = 3
 name = "feed"
-version = "3.0.0"
-desc = "Feed MCP plugin"
+version = "3.1.0"
+desc = "由 Timer 驱动的 Feed Content source 与用户 MCP"
 Config = FeedConfig
-inject = (MCP_SERVERS, PROACTIVE_COMPONENTS)
+inject = (MCP_SERVERS, TIMERS, CONTENT_SOURCE)
 skill_roots = ("skills",)
 
 
 async def apply(ctx: Context, config: object) -> None:
-    """注册 Feed MCP 与可选的订阅主动事件源。"""
+    """注册用户 MCP 工具和一个普通 Timer 驱动的 Content source。"""
 
     if not isinstance(config, FeedConfig):
         raise TypeError("feed config 必须是 FeedConfig")
 
-    # 1. 只声明 MCP；apply 本身不启动进程、不访问网络或插件数据。
+    # 1. MCP 只拥有用户触发的订阅管理和缓存查询。
     await ctx.require(MCP_SERVERS).register(
         ctx,
         McpServerDefinition(
             name="feed",
             command=("python", "mcp/run_mcp.py"),
-            required_tools=("get_proactive_events", "acknowledge_events"),
-            candidate_read_only_tools=("get_proactive_events",),
+            required_tools=("feed_manage", "feed_query"),
+            candidate_read_only_tools=(),
             candidate_env={"FEED_BACKEND": "recording"},
         ),
     )
 
-    # 2. 主动能力由用户配置决定是否发布。
-    if config.proactive.enabled:
-        await ctx.require(PROACTIVE_COMPONENTS).register(
-            ctx,
-            ProactiveSourceDefinition(
-                name="subscriptions",
-                channels=("content",),
-                mcp_server="feed",
-                fetch_tool="get_proactive_events",
-                ack_tool="acknowledge_events",
-                fetch_page_size=50,
-            ),
-        )
+    # 2. 正式 Root 独占外部轮询与 Content ACK。
+    runtime = FeedContentRuntime(
+        ctx.data_root,
+        ctx.require(TIMERS),
+        ctx.require(CONTENT_SOURCE).bind("feed-subscriptions"),
+    )
+
+    def setup() -> object:
+        return runtime.close
+
+    _ = await ctx.effect(setup, label="feed-content-source-runtime")
+    _ = await ctx.on(RUNTIME_STARTED, lambda _: runtime.start())
+    _ = await ctx.on(RUNTIME_STOPPING, lambda _: runtime.close())

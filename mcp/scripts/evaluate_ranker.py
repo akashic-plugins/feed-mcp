@@ -9,9 +9,10 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.path_config import resolve_feed_db, resolve_workspace_path
-from src import feed_backend
+from feed_runtime import backend as feed_backend
 
 
 def _precision(labels: list[int], k: int) -> float:
