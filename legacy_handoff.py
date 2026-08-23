@@ -45,28 +45,39 @@ class FeedLegacyHandoffAdapter:
 
     def accepts(self, fact: LegacyFact) -> bool:
         return (
-            fact.kind is LegacyFactKind.WAKE_SOURCE_ITEM
+            fact.kind in {LegacyFactKind.WAKE_SOURCE_ITEM, LegacyFactKind.WAKE_ACK}
             and fact.source_identity == LEGACY_SOURCE_ID
         )
 
     def plan(self, fact: LegacyFact) -> AdapterPlan:
         """Resolve one provider-owned revision without mounting or writing Content."""
 
-        row = _legacy_row(fact)
+        row = _fact_row(fact)
         provider = self._provider_item(_text(row, "source_event_id"))
-        return AdapterPlan(_target_identity(provider))
+        return AdapterPlan(_target_identity(fact.kind, provider))
 
     def apply(self, fact: LegacyFact, plan: AdapterPlan) -> TargetReceipt:
         """Submit the exact planned target and return its normalized durable receipt."""
 
         # 1. Re-read the owner row and reject a revision change after planning.
-        row = _legacy_row(fact)
+        row = _fact_row(fact)
         provider = self._provider_item(_text(row, "source_event_id"))
-        target_identity = _target_identity(provider)
+        target_identity = _target_identity(fact.kind, provider)
         if plan.target_identity != target_identity:
             raise RuntimeError("Feed handoff target identity drift after plan")
 
-        # 2. A fact-stable batch makes target-before-marker replay idempotent.
+        # 2. Each fact kind commits through its target owner's durable primitive.
+        if fact.kind is LegacyFactKind.WAKE_ACK:
+            acknowledgement = backend.settle_legacy_ack(
+                _text(provider, "event_id"),
+                _text(provider, "content_hash"),
+                _text(row, "action"),
+                fact.source_digest,
+                data_root=self._provider_db.parent,
+            )
+            return _ack_receipt(fact, target_identity, acknowledgement)
+
+        # 3. A fact-stable batch makes target-before-marker replay idempotent.
         batch_id = _batch_id(fact)
         item = _content_item(row, provider)
         content_receipt = self._content.submit(batch_id, (item,))
@@ -87,8 +98,14 @@ class FeedLegacyHandoffAdapter:
             return False
         if receipt.target_identity != plan.target_identity:
             return False
-        row = _legacy_row(fact)
+        row = _fact_row(fact)
         provider = self._provider_item(_text(row, "source_event_id"))
+        if fact.kind is LegacyFactKind.WAKE_ACK:
+            acknowledgement = self._provider_ack(fact.source_digest)
+            if acknowledgement is None:
+                return False
+            expected = _ack_receipt(fact, plan.target_identity, acknowledgement)
+            return receipt == expected
         item = _content_item(row, provider)
         batch_id = _batch_id(fact)
         submission = self._content.read_submission(batch_id)
@@ -103,6 +120,28 @@ class FeedLegacyHandoffAdapter:
             and receipt.receipt_digest == receipt_digest(normalized)
             and _revision_matches(revision, item)
         )
+
+    def _provider_ack(self, source_digest: str) -> dict[str, object] | None:
+        """Read one retained legacy ACK receipt without opening a writer."""
+
+        wal = self._provider_db.with_name(self._provider_db.name + "-wal")
+        if wal.is_file() and wal.stat().st_size > 0:
+            raise HandoffBlocked("feed_provider_checkpoint_required")
+        uri = self._provider_db.resolve().as_uri() + "?mode=ro&immutable=1"
+        with closing(sqlite3.connect(uri, uri=True)) as connection:
+            connection.row_factory = sqlite3.Row
+            _ = connection.execute("PRAGMA query_only = ON")
+            table = connection.execute(
+                "SELECT 1 FROM sqlite_master "
+                "WHERE type='table' AND name='legacy_ack_handoff_receipts'"
+            ).fetchone()
+            if table is None:
+                return None
+            result = connection.execute(
+                "SELECT * FROM legacy_ack_handoff_receipts WHERE source_digest = ?",
+                (source_digest,),
+            ).fetchone()
+        return None if result is None else {key: result[key] for key in result.keys()}
 
     def _provider_item(self, event_id: str) -> dict[str, object]:
         """Read one exact Feed row through a query-only SQLite connection."""
@@ -130,8 +169,8 @@ class FeedLegacyHandoffAdapter:
         return {key: result[key] for key in result.keys()}
 
 
-def _legacy_row(fact: LegacyFact) -> dict[str, object]:
-    if fact.kind is not LegacyFactKind.WAKE_SOURCE_ITEM:
+def _fact_row(fact: LegacyFact) -> dict[str, object]:
+    if fact.kind not in {LegacyFactKind.WAKE_SOURCE_ITEM, LegacyFactKind.WAKE_ACK}:
         raise TypeError("Feed handoff received another legacy fact kind")
     if fact.source_identity != LEGACY_SOURCE_ID:
         raise TypeError("Feed handoff received another legacy source owner")
@@ -144,9 +183,15 @@ def _legacy_row(fact: LegacyFact) -> dict[str, object]:
     event_id = _text(row, "source_event_id")
     if not fact.locator.endswith(f":{_text(row, 'item_id')}"):
         raise RuntimeError("Feed legacy locator does not match item_id")
-    payload = _payload(row)
-    if payload.get("event_id") != event_id or payload.get("kind") != "content":
-        raise RuntimeError("Feed legacy payload identity mismatch")
+    if fact.kind is LegacyFactKind.WAKE_SOURCE_ITEM:
+        payload = _payload(row)
+        if payload.get("event_id") != event_id or payload.get("kind") != "content":
+            raise RuntimeError("Feed legacy payload identity mismatch")
+    elif _text(row, "source_id") != LEGACY_SOURCE_ID or _text(row, "action") not in {
+        "consume",
+        "expire",
+    }:
+        raise RuntimeError("Feed legacy ACK identity mismatch")
     return row
 
 
@@ -182,10 +227,40 @@ def _content_item(
     }
 
 
-def _target_identity(provider: Mapping[str, object]) -> str:
+def _target_identity(kind: LegacyFactKind, provider: Mapping[str, object]) -> str:
+    prefix = "content" if kind is LegacyFactKind.WAKE_SOURCE_ITEM else "feed-ack"
     return (
-        f"content:{CONTENT_SOURCE_ID}:{_text(provider, 'event_id')}:"
+        f"{prefix}:{CONTENT_SOURCE_ID}:{_text(provider, 'event_id')}:"
         f"{_text(provider, 'content_hash')}"
+    )
+
+
+def _ack_receipt(
+    fact: LegacyFact,
+    target_identity: str,
+    acknowledgement: Mapping[str, object],
+) -> TargetReceipt:
+    normalized = {
+        "legacy_locator": fact.locator,
+        "legacy_source_digest": fact.source_digest,
+        "target_identity": target_identity,
+        "acknowledgement": {
+            key: acknowledgement[key]
+            for key in (
+                "receipt_id",
+                "source_digest",
+                "event_id",
+                "revision",
+                "action",
+                "acked_at",
+                "expires_at",
+            )
+        },
+    }
+    return TargetReceipt(
+        receipt_id=_text(acknowledgement, "receipt_id"),
+        receipt_digest=receipt_digest(normalized),
+        target_identity=target_identity,
     )
 
 

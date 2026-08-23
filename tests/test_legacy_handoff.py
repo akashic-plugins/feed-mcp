@@ -76,6 +76,31 @@ def _fact(row: Mapping[str, object]) -> LegacyFact:
     )
 
 
+def _ack_fact(row: Mapping[str, object], action: str = "consume") -> LegacyFact:
+    event_id = cast(str, row["source_event_id"])
+    item_id = cast(str, row["item_id"])
+    acknowledgement = {
+        "source_id": LEGACY_SOURCE_ID,
+        "source_event_id": event_id,
+        "item_id": item_id,
+        "action": action,
+        "queued_at": "2026-08-23T10:00:00+00:00",
+    }
+    opaque = json.dumps(
+        acknowledgement, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return LegacyFact(
+        kind=LegacyFactKind.WAKE_ACK,
+        locator=(
+            "wake:pending_acknowledgements:"
+            f"{LEGACY_SOURCE_ID}:{event_id}:{item_id}"
+        ),
+        source_digest=hashlib.sha256(opaque).hexdigest(),
+        source_identity=LEGACY_SOURCE_ID,
+        opaque=opaque,
+    )
+
+
 def _seed_provider(data_root: Path, rows: Sequence[Mapping[str, object]]) -> None:
     config = backend.load_config(data_root)
     connection = backend._connect(config)
@@ -307,6 +332,51 @@ def test_already_acked_target_replays_and_source_ack_is_bound_once(
     assert adapter.apply(fact, plan) == receipt
     assert adapter.verify(fact, receipt) is True
     assert store.state_counts() == {"settled": 1}
+
+
+@pytest.mark.parametrize("action", ["consume", "expire"])
+def test_core_hands_off_pending_ack_once_after_target_replay(
+    tmp_path: Path,
+    action: str,
+) -> None:
+    data_root, store, _bound, adapter = _fixture(tmp_path)
+    fact = _ack_fact(_legacy_rows()[0], action)
+    inventory = Inventory((fact,), ())
+    workspace = tmp_path / "workspace"
+
+    def crash_after_target(_fact: LegacyFact, _receipt: object) -> None:
+        raise RuntimeError("crash before central ACK marker")
+
+    with pytest.raises(RuntimeError, match="crash before central ACK marker"):
+        apply_handoff(
+            workspace,
+            inventory,
+            (adapter,),
+            after_target=crash_after_target,
+        )
+
+    config = backend.load_config(data_root)
+    with closing(backend._connect(config)) as connection:
+        assert connection.execute("SELECT count(*) FROM acked_items").fetchone()[0] == 1
+        assert connection.execute(
+            "SELECT count(*) FROM legacy_ack_handoff_receipts"
+        ).fetchone()[0] == 1
+        connection.execute("DELETE FROM acked_items")
+        connection.commit()
+
+    recovered = apply_handoff(workspace, inventory, (adapter,))
+
+    assert recovered.status is HandoffStatus.APPLIED
+    assert recovered.items[0].state == "applied"
+    assert store.state_counts() == {}
+    with closing(backend._connect(config)) as connection:
+        assert connection.execute("SELECT count(*) FROM acked_items").fetchone()[0] == 0
+        assert [
+            tuple(row)
+            for row in connection.execute(
+                "SELECT event_id, revision, action FROM legacy_ack_handoff_receipts"
+            ).fetchall()
+        ] == [("event-01", "revision-01", action)]
 
 
 def test_provider_plan_requires_checkpoint_and_creates_no_files(

@@ -1954,6 +1954,165 @@ def settle_content_item(
         conn.close()
 
 
+def settle_legacy_ack(
+    event_id: str,
+    revision: str,
+    action: str,
+    source_digest: str,
+    *,
+    data_root: Path,
+) -> dict[str, str]:
+    """Commit one legacy Wake ACK and retain its target-owned receipt."""
+
+    cfg = load_config(data_root)
+    conn = _connect(cfg)
+    now = _now()
+    receipt_id = f"feed-legacy-ack:{source_digest}"
+    try:
+        # 1. Reuse a completed handoff without extending the provider ACK.
+        _ensure_legacy_ack_receipts(conn)
+        existing = conn.execute(
+            "SELECT * FROM legacy_ack_handoff_receipts WHERE receipt_id = ?",
+            (receipt_id,),
+        ).fetchone()
+        if existing is not None:
+            identity = tuple(
+                str(existing[field])
+                for field in ("source_digest", "event_id", "revision", "action")
+            )
+            if identity != (source_digest, event_id, revision, action):
+                raise RuntimeError("Feed legacy ACK receipt identity conflict")
+            return _legacy_ack_receipt(existing)
+
+        # 2. Commit one exact provider ACK and its durable receipt atomically.
+        acked_at, expires_at = _commit_legacy_provider_ack(
+            conn, cfg, event_id, revision, now
+        )
+        _insert_legacy_ack_receipt(
+            conn,
+            receipt_id,
+            source_digest,
+            event_id,
+            revision,
+            action,
+            acked_at,
+            expires_at,
+            now,
+        )
+        conn.commit()
+        row = conn.execute(
+            "SELECT * FROM legacy_ack_handoff_receipts WHERE receipt_id = ?",
+            (receipt_id,),
+        ).fetchone()
+        if row is None:
+            raise RuntimeError("Feed legacy ACK receipt commit missing")
+        return _legacy_ack_receipt(row)
+    finally:
+        conn.close()
+
+
+def _ensure_legacy_ack_receipts(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS legacy_ack_handoff_receipts(
+            receipt_id TEXT PRIMARY KEY,
+            source_digest TEXT NOT NULL UNIQUE,
+            event_id TEXT NOT NULL,
+            revision TEXT NOT NULL,
+            action TEXT NOT NULL,
+            acked_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            committed_at TEXT NOT NULL
+        )
+        """
+    )
+
+
+def _commit_legacy_provider_ack(
+    conn: sqlite3.Connection,
+    cfg: FeedMcpConfig,
+    event_id: str,
+    revision: str,
+    now: datetime,
+) -> tuple[str, str]:
+    """Preserve a live provider ACK or establish one new retention window."""
+
+    current = conn.execute(
+        "SELECT content_hash FROM items WHERE event_id = ?", (event_id,)
+    ).fetchone()
+    if current is None:
+        raise RuntimeError(f"Feed legacy ACK provider item missing: {event_id}")
+    if str(current["content_hash"]) != revision:
+        raise RuntimeError(f"Feed legacy ACK revision changed: {event_id}")
+    acknowledgement = conn.execute(
+        "SELECT acked_at, expires_at FROM acked_items WHERE event_id = ?",
+        (event_id,),
+    ).fetchone()
+    if acknowledgement is not None and datetime.fromisoformat(
+        str(acknowledgement["expires_at"])
+    ) > now:
+        return str(acknowledgement["acked_at"]), str(acknowledgement["expires_at"])
+    acked_at = now.isoformat()
+    expires_at = (now + timedelta(hours=cfg.item_retention_hours)).isoformat()
+    conn.execute(
+        """
+        INSERT INTO acked_items(event_id, acked_at, expires_at)
+        VALUES (?, ?, ?)
+        ON CONFLICT(event_id) DO UPDATE SET
+            acked_at=excluded.acked_at,
+            expires_at=excluded.expires_at
+        """,
+        (event_id, acked_at, expires_at),
+    )
+    return acked_at, expires_at
+
+
+def _insert_legacy_ack_receipt(
+    conn: sqlite3.Connection,
+    receipt_id: str,
+    source_digest: str,
+    event_id: str,
+    revision: str,
+    action: str,
+    acked_at: str,
+    expires_at: str,
+    now: datetime,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO legacy_ack_handoff_receipts(
+            receipt_id, source_digest, event_id, revision, action,
+            acked_at, expires_at, committed_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            receipt_id,
+            source_digest,
+            event_id,
+            revision,
+            action,
+            acked_at,
+            expires_at,
+            now.isoformat(),
+        ),
+    )
+
+
+def _legacy_ack_receipt(row: sqlite3.Row) -> dict[str, str]:
+    return {
+        field: str(row[field])
+        for field in (
+            "receipt_id",
+            "source_digest",
+            "event_id",
+            "revision",
+            "action",
+            "acked_at",
+            "expires_at",
+        )
+    }
+
+
 def content_source_deadline(*, data_root: Path, now: datetime) -> datetime:
     """Return the durable next source deadline, defaulting to immediate work."""
 
