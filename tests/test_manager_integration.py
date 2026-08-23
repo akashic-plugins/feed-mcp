@@ -6,7 +6,6 @@ import json
 import os
 import shutil
 import sqlite3
-import sys
 import time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -23,6 +22,11 @@ from feed_runtime import backend
 
 ROOT = Path(__file__).resolve().parents[1]
 CORE_ROOT = Path(os.environ["AKASHIC_AGENT_ROOT"])
+
+
+def _fixture_runtime() -> Path:
+    artifact_python = Path(os.environ["AKASHIC_PLUGIN_FIXTURE_PYTHON"])
+    return artifact_python.parent.parent
 
 
 class _TimerHandle:
@@ -80,6 +84,7 @@ async def _eventually(predicate) -> None:
 def _stage_plugins(tmp_path: Path) -> tuple[Path, Path]:
     """将真实 Content、Feed 插件装入临时测试环境。"""
 
+    runtime = _fixture_runtime()
     plugins = tmp_path / "plugins"
     content = plugins / "content"
     feed = plugins / "feed"
@@ -97,7 +102,6 @@ def _stage_plugins(tmp_path: Path) -> tuple[Path, Path]:
             "tests",
         ),
     )
-    runtime = Path(sys.executable).parent.parent
     (feed / "mcp" / ".venv").symlink_to(runtime, target_is_directory=True)
     return content, feed
 
@@ -105,12 +109,12 @@ def _stage_plugins(tmp_path: Path) -> tuple[Path, Path]:
 def _stage_legacy_plugins(tmp_path: Path) -> tuple[Path, Path]:
     """装入 Content 和旧 lifespan Feed owner fixture。"""
 
+    runtime = _fixture_runtime()
     plugins = tmp_path / "plugins"
     content = plugins / "content"
     feed = plugins / "feed"
     shutil.copytree(CORE_ROOT / "plugins" / "content", content)
     shutil.copytree(ROOT / "tests" / "fixtures" / "legacy_feed_owner", feed)
-    runtime = Path(sys.executable).parent.parent
     (feed / "mcp" / ".venv").symlink_to(runtime, target_is_directory=True)
     return content, feed
 
@@ -118,6 +122,7 @@ def _stage_legacy_plugins(tmp_path: Path) -> tuple[Path, Path]:
 def _replace_with_current_feed(feed: Path) -> None:
     """只将临时旧 Feed source 替换为当前插件树。"""
 
+    runtime = _fixture_runtime()
     shutil.rmtree(feed)
     shutil.copytree(
         ROOT,
@@ -132,8 +137,35 @@ def _replace_with_current_feed(feed: Path) -> None:
             "tests",
         ),
     )
-    runtime = Path(sys.executable).parent.parent
     (feed / "mcp" / ".venv").symlink_to(runtime, target_is_directory=True)
+
+
+def test_stage_plugins_uses_explicit_fixture_runtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = tmp_path / "artifact-runtime"
+    artifact_python = runtime / "bin" / "python"
+    artifact_python.parent.mkdir(parents=True)
+    artifact_python.touch()
+    monkeypatch.setenv("AKASHIC_PLUGIN_FIXTURE_PYTHON", str(artifact_python))
+
+    _content, feed = _stage_plugins(tmp_path / "stage")
+
+    assert (feed / "mcp" / ".venv").resolve() == runtime.resolve()
+
+
+def test_stage_plugins_requires_fixture_python_before_writes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("AKASHIC_PLUGIN_FIXTURE_PYTHON", raising=False)
+    stage = tmp_path / "missing-runtime"
+
+    with pytest.raises(KeyError, match="AKASHIC_PLUGIN_FIXTURE_PYTHON"):
+        _stage_plugins(stage)
+
+    assert not stage.exists()
 
 
 def _seed_item(data_root: Path, now: datetime) -> None:
