@@ -89,6 +89,8 @@ def _stage_plugins(tmp_path: Path) -> tuple[Path, Path]:
         feed,
         ignore=shutil.ignore_patterns(
             ".git",
+            ".akashic-core",
+            ".plugin-contracts",
             ".pytest_cache",
             ".venv",
             "__pycache__",
@@ -122,6 +124,8 @@ def _replace_with_current_feed(feed: Path) -> None:
         feed,
         ignore=shutil.ignore_patterns(
             ".git",
+            ".akashic-core",
+            ".plugin-contracts",
             ".pytest_cache",
             ".venv",
             "__pycache__",
