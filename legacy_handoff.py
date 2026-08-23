@@ -40,6 +40,7 @@ class FeedLegacyHandoffAdapter:
     """Move exact legacy Feed reservoir facts into the existing Content source."""
 
     def __init__(self, feed_data_root: Path, content: BoundContentSource) -> None:
+        self._data_root = feed_data_root
         self._provider_db = backend.provider_database_path(feed_data_root)
         self._content = content
 
@@ -73,7 +74,7 @@ class FeedLegacyHandoffAdapter:
                 _text(provider, "content_hash"),
                 _text(row, "action"),
                 fact.source_digest,
-                data_root=self._provider_db.parent,
+                data_root=self._data_root,
             )
             return _ack_receipt(fact, target_identity, acknowledgement)
 

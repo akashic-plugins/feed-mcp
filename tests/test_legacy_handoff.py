@@ -392,3 +392,20 @@ def test_provider_plan_requires_checkpoint_and_creates_no_files(
 
     assert _tree_state(tmp_path) == before
     assert store.state_counts() == {}
+
+
+def test_pending_ack_uses_original_root_for_nested_provider_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = backend._config_values()
+    config["db_path"] = "state/feed.sqlite3"
+    monkeypatch.setattr(backend, "_config_values", lambda: config)
+    data_root, _store, _bound, adapter = _fixture(tmp_path)
+    fact = _ack_fact(_legacy_rows()[0])
+
+    receipt = adapter.apply(fact, adapter.plan(fact))
+
+    assert adapter.verify(fact, receipt) is True
+    assert (data_root / "state" / "feed.sqlite3").is_file()
+    assert not (data_root / "state" / "state" / "feed.sqlite3").exists()
