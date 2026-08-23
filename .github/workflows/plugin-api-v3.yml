@@ -56,6 +56,7 @@ jobs:
       - name: Run Feed unit tests
         env:
           AKASHIC_AGENT_ROOT: .akashic-core
+          AKASHIC_PLUGIN_FIXTURE_PYTHON: ${{ github.workspace }}/mcp/.venv/bin/python
           PYTHONPATH: .akashic-core:mcp/.venv/lib/python3.13/site-packages
         run: mcp/.venv/bin/python -m pytest -q mcp/tests tests
       - name: Run pyright
