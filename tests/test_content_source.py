@@ -58,6 +58,10 @@ class _Content:
         self.submissions: list[tuple[str, tuple[dict[str, object], ...]]] = []
         self.rows: list[dict[str, object]] = []
         self.fail_ack_once = False
+        self.ack_receipt: dict[str, object] = {
+            "settled": True,
+            "duplicate": False,
+        }
 
     def submit(self, batch_id, items):
         frozen = tuple(dict(item) for item in items)
@@ -71,10 +75,13 @@ class _Content:
         if self.fail_ack_once:
             self.fail_ack_once = False
             raise RuntimeError("crash after provider ACK")
-        self.rows = [
-            row for row in self.rows if row["settlement_ref"] != settlement_ref
-        ]
-        return {"changed": True}
+        if self.ack_receipt.get("settled") is True:
+            self.rows = [
+                row
+                for row in self.rows
+                if row["settlement_ref"] != settlement_ref
+            ]
+        return dict(self.ack_receipt)
 
 
 def _seed_item(data_root: Path, now: datetime) -> None:
@@ -177,3 +184,50 @@ async def test_provider_ack_retries_after_crash_before_content_ack(
         assert connection.execute(
             "SELECT event_id FROM acked_items"
         ).fetchall() == [("event-1",)]
+
+
+@pytest.mark.asyncio
+async def test_duplicate_content_ack_is_already_settled(tmp_path: Path) -> None:
+    now = datetime(2026, 8, 23, 10, tzinfo=UTC)
+    _seed_item(tmp_path, now)
+    content = _Content()
+    content.rows = [
+        {
+            "ref": {"item_id": "event-1", "revision": "revision-1"},
+            "settlement_ref": "delivery:1",
+        }
+    ]
+    content.ack_receipt = {"settled": True, "duplicate": True}
+    runtime = FeedContentRuntime(
+        tmp_path,
+        PluginTimers(_Timer(now)),
+        content,
+        now=lambda: now,
+    )
+
+    assert await runtime._settle_delivered() == 1  # pyright: ignore[reportPrivateUsage]
+    assert content.rows == []
+
+
+@pytest.mark.asyncio
+async def test_unsettled_content_ack_fails_loud(tmp_path: Path) -> None:
+    now = datetime(2026, 8, 23, 10, tzinfo=UTC)
+    _seed_item(tmp_path, now)
+    content = _Content()
+    content.rows = [
+        {
+            "ref": {"item_id": "event-1", "revision": "revision-1"},
+            "settlement_ref": "delivery:1",
+        }
+    ]
+    content.ack_receipt = {"settled": False, "reason": "state_mismatch"}
+    runtime = FeedContentRuntime(
+        tmp_path,
+        PluginTimers(_Timer(now)),
+        content,
+        now=lambda: now,
+    )
+
+    with pytest.raises(RuntimeError, match="Feed Content ACK 未提交"):
+        await runtime._settle_delivered()  # pyright: ignore[reportPrivateUsage]
+    assert content.rows

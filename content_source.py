@@ -174,7 +174,7 @@ class FeedContentRuntime:
                     row["settlement_ref"], "Feed settlement_ref"
                 )
                 receipt = self._content.ack(settlement_ref)
-                if receipt.get("changed") is not True:
+                if receipt.get("settled") is not True:
                     raise RuntimeError(f"Feed Content ACK 未提交: {receipt!r}")
                 settled += 1
         return settled
