@@ -28,7 +28,6 @@ from typing import Any
 from urllib.parse import unquote, urlparse
 
 import requests
-import feedparser
 
 logger = logging.getLogger(__name__)
 
@@ -540,32 +539,65 @@ def _find_child_text(el: ET.Element, *names: str) -> str:
     return ""
 
 
+def _find_child(el: ET.Element, *names: str) -> ET.Element | None:
+    wanted = {name.lower() for name in names}
+    for child in el:
+        if _xml_local_name(child.tag).lower() in wanted:
+            return child
+    return None
+
+
+def _element_text(el: ET.Element | None) -> str:
+    if el is None:
+        return ""
+    return _strip("".join(el.itertext()))
+
+
+def _entry_link(entry: ET.Element) -> str | None:
+    links = [child for child in entry if _xml_local_name(child.tag).lower() == "link"]
+    for link in links:
+        href = _strip(link.attrib.get("href"))
+        rel = _strip(link.attrib.get("rel")).lower()
+        if href and rel in {"", "alternate"}:
+            return href
+    for link in links:
+        value = _strip(link.attrib.get("href")) or _element_text(link)
+        if value:
+            return value
+    return None
+
+
+def _entry_author(entry: ET.Element) -> str | None:
+    author = _find_child(entry, "author", "creator")
+    if author is None:
+        return None
+    name = _find_child_text(author, "name")
+    return name or _element_text(author) or None
+
+
 def _parse_rss(xml_text: str) -> list[dict[str, str | None]]:
     xml_text = _normalize_xml_text(xml_text)
     if _is_xcancel_whitelist_feed(xml_text):
         return []
-    feed = feedparser.parse(xml_text)
+    root = ET.fromstring(xml_text)
+    entries = [
+        element
+        for element in root.iter()
+        if _xml_local_name(element.tag).lower() in {"item", "entry"}
+    ]
     items: list[dict[str, str | None]] = []
-    for entry in feed.entries:
-        content_parts = entry.get("content") or []
-        content = (
-            str(content_parts[0].get("value") or "")
-            if content_parts
-            else str(entry.get("summary") or entry.get("description") or "")
-        )
-        parsed_time = entry.get("published_parsed") or entry.get("updated_parsed")
-        published_at = (
-            datetime(*parsed_time[:6], tzinfo=UTC).isoformat()
-            if isinstance(parsed_time, time.struct_time)
-            else _parse_dt(str(entry.get("published") or entry.get("updated") or ""))
+    for entry in entries:
+        content = _element_text(_find_child(entry, "content", "encoded", "summary", "description"))
+        published_at = _parse_dt(
+            _find_child_text(entry, "published", "pubdate", "updated", "date")
         )
         items.append(
             {
-                "entry_id": _strip(str(entry.get("id") or entry.get("guid") or "")) or None,
-                "title": _strip(str(entry.get("title") or "")),
+                "entry_id": _find_child_text(entry, "id", "guid") or None,
+                "title": _find_child_text(entry, "title"),
                 "content": _strip_html(content)[:_MAX_CONTENT],
-                "url": _strip(str(entry.get("link") or "")) or None,
-                "author": _strip(str(entry.get("author") or "")) or None,
+                "url": _entry_link(entry),
+                "author": _entry_author(entry),
                 "published_at": published_at,
             }
         )
