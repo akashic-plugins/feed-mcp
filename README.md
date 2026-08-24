@@ -55,7 +55,7 @@ Core H2 handoff 前把整批 pre-cutover provider revision 原子标记为
 
 ## 验证
 
-CI 固定 Core `9da3a988a2bf62b0f550bd4f6bb98c4eeb1f56f5`，运行单元测试、真实
+CI 固定 Core `065dfb7fb37534c57ed500b1ed9b5deb7090cdb0`，运行单元测试、真实
 Manager + stdio MCP + Content + Timer fixture、pyright、compileall 和
 `git diff --check`。Manager fixture 还证明：候选零 Timer/零正式写，发布时旧
 Timer 已取消后新稳定 Root 才接班。
