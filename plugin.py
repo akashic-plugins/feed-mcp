@@ -23,7 +23,7 @@ CONTENT_SOURCE = ServiceKey[ContentSourceServices]("content.source.v1")
 
 api_version = 3
 name = "feed"
-version = "3.1.1"
+version = "3.1.2"
 desc = "由 Timer 驱动的 Feed Content source 与用户 MCP"
 Config = FeedConfig
 inject = (MCP_SERVERS, TIMERS, CONTENT_SOURCE)
