@@ -17,8 +17,7 @@ from agent.migrations.proactive_island import (
 )
 from agent.migrations.proactive_island.handoff import receipt_digest
 
-from content_source import CONTENT_SOURCE_ID
-from feed_runtime import backend
+from feed_runtime import CONTENT_SOURCE_ID, backend
 
 
 LEGACY_SOURCE_ID = "feed@github:subscriptions"

@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-import plugin
+from feed_test_plugin import plugin
 from run_mcp import _runtime_dir
 from feed_runtime import backend as feed_backend
 from feed_runtime.backend import _config_path, _runtime_root, load_config

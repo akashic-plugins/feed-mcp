@@ -11,7 +11,7 @@ import pytest
 
 from agent.control.timer import TimerReceipt, TimerStatus
 from agent.plugin_composition import PluginTimers
-from content_source import FeedContentRuntime
+from feed_test_plugin.content_source import FeedContentRuntime
 from feed_runtime import backend
 
 

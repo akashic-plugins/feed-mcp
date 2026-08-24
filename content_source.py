@@ -13,10 +13,7 @@ from typing import Protocol, cast
 from agent.control.timer import TimerHandle, TimerStatus
 from agent.plugin_composition import PluginTimers
 
-from feed_runtime import backend
-
-
-CONTENT_SOURCE_ID = "feed-subscriptions"
+from .feed_runtime import CONTENT_SOURCE_ID, backend
 
 
 class BoundContentSource(Protocol):
