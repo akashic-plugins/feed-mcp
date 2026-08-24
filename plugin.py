@@ -12,7 +12,7 @@ from agent.plugin_composition import (
     ServiceKey,
 )
 
-from content_source import CONTENT_SOURCE_ID, ContentSourceServices, FeedContentRuntime
+from .content_source import CONTENT_SOURCE_ID, ContentSourceServices, FeedContentRuntime
 
 
 class FeedConfig(BaseModel):

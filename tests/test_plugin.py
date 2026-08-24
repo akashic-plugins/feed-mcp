@@ -6,7 +6,7 @@ from typing import cast
 
 import pytest
 
-import plugin
+from feed_test_plugin import plugin
 from agent.control.timer import OneShotTimer
 from agent.plugin_composition import (
     MCP_SERVERS,
@@ -22,7 +22,7 @@ from agent.plugin_composition.mcp_slots import (
 from agent.plugins.composable import ComposablePlugin
 from agent.plugins.manager import _copy_validation_data
 from agent.plugins.static_manifest import load_static_plugin_manifest
-from content_source import BoundContentSource, ContentSourceServices
+from feed_test_plugin.content_source import BoundContentSource, ContentSourceServices
 
 
 ROOT = Path(__file__).resolve().parents[1]
