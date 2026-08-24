@@ -39,10 +39,23 @@ class BoundContentSource(Protocol):
 class FeedLegacyHandoffAdapter:
     """Move exact legacy Feed reservoir facts into the existing Content source."""
 
-    def __init__(self, feed_data_root: Path, content: BoundContentSource) -> None:
+    def __init__(
+        self,
+        feed_data_root: Path,
+        content: BoundContentSource | None,
+        *,
+        supersede_backlog: bool = False,
+    ) -> None:
         self._data_root = feed_data_root
         self._provider_db = backend.provider_database_path(feed_data_root)
         self._content = content
+        self._supersede_backlog = supersede_backlog
+
+    @classmethod
+    def for_cutover(cls, feed_data_root: Path) -> FeedLegacyHandoffAdapter:
+        """Build the explicit pre-cutover backlog supersession owner."""
+
+        return cls(feed_data_root, None, supersede_backlog=True)
 
     def accepts(self, fact: LegacyFact) -> bool:
         return (
@@ -55,7 +68,13 @@ class FeedLegacyHandoffAdapter:
 
         row = _fact_row(fact)
         provider = self._provider_item(_text(row, "source_event_id"))
-        return AdapterPlan(_target_identity(fact.kind, provider))
+        return AdapterPlan(
+            _target_identity(
+                fact.kind,
+                provider,
+                supersede_backlog=self._supersede_backlog,
+            )
+        )
 
     def apply(self, fact: LegacyFact, plan: AdapterPlan) -> TargetReceipt:
         """Submit the exact planned target and return its normalized durable receipt."""
@@ -63,7 +82,11 @@ class FeedLegacyHandoffAdapter:
         # 1. Re-read the owner row and reject a revision change after planning.
         row = _fact_row(fact)
         provider = self._provider_item(_text(row, "source_event_id"))
-        target_identity = _target_identity(fact.kind, provider)
+        target_identity = _target_identity(
+            fact.kind,
+            provider,
+            supersede_backlog=self._supersede_backlog,
+        )
         if plan.target_identity != target_identity:
             raise RuntimeError("Feed handoff target identity drift after plan")
 
@@ -78,7 +101,20 @@ class FeedLegacyHandoffAdapter:
             )
             return _ack_receipt(fact, target_identity, acknowledgement)
 
-        # 3. A fact-stable batch makes target-before-marker replay idempotent.
+        # 3. Explicit cutover supersession ACKs the provider without creating Content.
+        if self._supersede_backlog:
+            acknowledgement = backend.settle_legacy_ack(
+                _text(provider, "event_id"),
+                _text(provider, "content_hash"),
+                "cutover_superseded",
+                fact.source_digest,
+                data_root=self._data_root,
+            )
+            return _ack_receipt(fact, target_identity, acknowledgement)
+
+        # 4. A fact-stable batch makes target-before-marker replay idempotent.
+        if self._content is None:
+            raise RuntimeError("Feed Content target is unavailable")
         batch_id = _batch_id(fact)
         item = _content_item(row, provider)
         content_receipt = self._content.submit(batch_id, (item,))
@@ -101,12 +137,18 @@ class FeedLegacyHandoffAdapter:
             return False
         row = _fact_row(fact)
         provider = self._provider_item(_text(row, "source_event_id"))
-        if fact.kind is LegacyFactKind.WAKE_ACK:
+        if fact.kind is LegacyFactKind.WAKE_ACK or self._supersede_backlog:
             acknowledgement = self._provider_ack(fact.source_digest)
             if acknowledgement is None:
                 return False
+            if self._supersede_backlog and not self._provider_is_acked(
+                _text(provider, "event_id")
+            ):
+                return False
             expected = _ack_receipt(fact, plan.target_identity, acknowledgement)
             return receipt == expected
+        if self._content is None:
+            raise RuntimeError("Feed Content target is unavailable")
         item = _content_item(row, provider)
         batch_id = _batch_id(fact)
         submission = self._content.read_submission(batch_id)
@@ -169,6 +211,17 @@ class FeedLegacyHandoffAdapter:
             raise HandoffBlocked(f"feed_provider_item_missing:{event_id}")
         return {key: result[key] for key in result.keys()}
 
+    def _provider_is_acked(self, event_id: str) -> bool:
+        """Verify the cutover suppression row without opening a writer."""
+
+        uri = self._provider_db.resolve().as_uri() + "?mode=ro&immutable=1"
+        with closing(sqlite3.connect(uri, uri=True)) as connection:
+            _ = connection.execute("PRAGMA query_only = ON")
+            result = connection.execute(
+                "SELECT 1 FROM acked_items WHERE event_id = ?", (event_id,)
+            ).fetchone()
+        return result is not None
+
 
 def _fact_row(fact: LegacyFact) -> dict[str, object]:
     if fact.kind not in {LegacyFactKind.WAKE_SOURCE_ITEM, LegacyFactKind.WAKE_ACK}:
@@ -228,8 +281,16 @@ def _content_item(
     }
 
 
-def _target_identity(kind: LegacyFactKind, provider: Mapping[str, object]) -> str:
-    prefix = "content" if kind is LegacyFactKind.WAKE_SOURCE_ITEM else "feed-ack"
+def _target_identity(
+    kind: LegacyFactKind,
+    provider: Mapping[str, object],
+    *,
+    supersede_backlog: bool = False,
+) -> str:
+    if kind is LegacyFactKind.WAKE_SOURCE_ITEM and supersede_backlog:
+        prefix = "feed-cutover-superseded"
+    else:
+        prefix = "content" if kind is LegacyFactKind.WAKE_SOURCE_ITEM else "feed-ack"
     return (
         f"{prefix}:{CONTENT_SOURCE_ID}:{_text(provider, 'event_id')}:"
         f"{_text(provider, 'content_hash')}"

@@ -47,6 +47,12 @@ feed-mcp
 正式数据由 Core 分配到 `plugin-data/feed-<marketplace>/`。从 v2 迁移仍使用
 `scripts/migrate_v2_data.py`；它保留源数据并产生可核对的 migration receipt。
 
+旧 proactive island 正式切换使用
+`scripts/retire_legacy_feed_backlog.py`。默认 `--plan` 只读输出 Core inventory 与
+Feed 当前完整 backlog 的 count/digest；显式 `--apply` 必须回传这些 exact 值，并在
+Core H2 handoff 前把整批 pre-cutover provider revision 原子标记为
+`cutover_superseded`。该路径不向 Content 提交旧条目，重复执行只接受同一 batch receipt。
+
 ## 验证
 
 CI 固定 Core `9da3a988a2bf62b0f550bd4f6bb98c4eeb1f56f5`，运行单元测试、真实

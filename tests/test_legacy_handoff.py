@@ -231,6 +231,107 @@ def test_target_before_marker_replay_returns_same_receipt(tmp_path: Path) -> Non
     assert store.state_counts() == {"pending": 1}
 
 
+def test_cutover_supersedes_backlog_without_submitting_content(tmp_path: Path) -> None:
+    data_root, store, _bound, _adapter = _fixture(tmp_path)
+    adapter = FeedLegacyHandoffAdapter.for_cutover(data_root)
+    facts = tuple(_fact(row) for row in _legacy_rows())
+
+    receipts = tuple(adapter.apply(fact, adapter.plan(fact)) for fact in facts)
+
+    assert all(
+        adapter.verify(fact, receipt)
+        for fact, receipt in zip(facts, receipts, strict=True)
+    )
+    assert store.state_counts() == {}
+    assert backend.prepare_content_items(data_root=data_root) == ()
+    config = backend.load_config(data_root)
+    with closing(backend._connect(config)) as connection:
+        assert connection.execute("SELECT count(*) FROM acked_items").fetchone()[0] == 15
+        assert connection.execute(
+            "SELECT count(*) FROM legacy_ack_handoff_receipts "
+            "WHERE action='cutover_superseded'"
+        ).fetchone()[0] == 15
+
+
+def test_cutover_replay_uses_same_receipt_and_requires_provider_ack(
+    tmp_path: Path,
+) -> None:
+    data_root, store, _bound, _adapter = _fixture(tmp_path)
+    adapter = FeedLegacyHandoffAdapter.for_cutover(data_root)
+    fact = _fact(_legacy_rows()[0])
+    plan = adapter.plan(fact)
+
+    first = adapter.apply(fact, plan)
+    repeated = adapter.apply(fact, plan)
+
+    assert repeated == first
+    assert adapter.verify(fact, repeated) is True
+    assert store.state_counts() == {}
+    config = backend.load_config(data_root)
+    with closing(backend._connect(config)) as connection:
+        connection.execute("DELETE FROM acked_items")
+        connection.commit()
+    assert adapter.verify(fact, repeated) is False
+
+
+def test_provider_backlog_plan_is_read_only_and_batch_supersession_is_exact(
+    tmp_path: Path,
+) -> None:
+    data_root, store, _bound, _adapter = _fixture(tmp_path)
+    config = backend.load_config(data_root)
+    with closing(backend._connect(config)) as connection:
+        now = datetime.now(UTC).isoformat()
+        connection.execute(
+            "UPDATE items SET published_at = ?, first_seen_at = ?", (now, now)
+        )
+        connection.commit()
+    before = _tree_state(tmp_path)
+
+    planned = backend.plan_content_backlog(data_root=data_root)
+
+    assert len(planned) == 15
+    assert _tree_state(tmp_path) == before
+    receipt = backend.supersede_content_backlog(
+        "cutover:fixture",
+        planned,
+        data_root=data_root,
+    )
+    repeated = backend.supersede_content_backlog(
+        "cutover:fixture",
+        planned,
+        data_root=data_root,
+    )
+    assert repeated == receipt
+    assert receipt["item_count"] == 15
+    assert backend.verify_content_backlog_supersession(
+        "cutover:fixture", planned, data_root=data_root
+    )
+    assert backend.plan_content_backlog(data_root=data_root) == ()
+    assert store.state_counts() == {}
+
+
+def test_provider_backlog_supersession_rejects_revision_drift(tmp_path: Path) -> None:
+    data_root, _store, _bound, _adapter = _fixture(tmp_path)
+    config = backend.load_config(data_root)
+    with closing(backend._connect(config)) as connection:
+        now = datetime.now(UTC).isoformat()
+        connection.execute(
+            "UPDATE items SET published_at = ?, first_seen_at = ?", (now, now)
+        )
+        connection.commit()
+    planned = backend.plan_content_backlog(data_root=data_root)
+    with closing(backend._connect(config)) as connection:
+        connection.execute(
+            "UPDATE items SET content_hash='changed' WHERE event_id='event-01'"
+        )
+        connection.commit()
+
+    with pytest.raises(RuntimeError, match="provider revision changed"):
+        backend.supersede_content_backlog(
+            "cutover:fixture", planned, data_root=data_root
+        )
+
+
 def test_core_replays_after_target_receipt_before_lineage_marker(
     tmp_path: Path,
 ) -> None:
