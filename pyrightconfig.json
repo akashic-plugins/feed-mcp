@@ -1,6 +1,9 @@
 {
   "include": [
     "plugin.py",
+    "content_source.py",
+    "legacy_handoff.py",
+    "feed_runtime",
     "mcp/run_mcp.py",
     "mcp/src",
     "scripts",

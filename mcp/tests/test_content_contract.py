@@ -7,7 +7,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from src import feed_backend
+from feed_runtime import backend as feed_backend
 
 
 def _insert_item(conn, *, index: int, source: str, published_at: datetime) -> str:
@@ -37,13 +37,13 @@ def _insert_item(conn, *, index: int, source: str, published_at: datetime) -> st
     return event_id
 
 
-def test_wake_fetch_returns_all_unread_grouped_by_source_and_consumption_is_not_feedback(
+def test_content_export_preserves_full_payload_and_exact_ack(
     tmp_path, monkeypatch
 ):
     now = datetime(2026, 7, 12, 12, tzinfo=UTC)
     monkeypatch.setenv("AKA_PLUGIN_DATA_DIR", str(tmp_path))
     monkeypatch.setattr(feed_backend, "_now", lambda: now)
-    cfg = feed_backend.load_config()
+    cfg = feed_backend.load_config(tmp_path)
     conn = feed_backend._connect(cfg)
     expected = []
     try:
@@ -61,19 +61,24 @@ def test_wake_fetch_returns_all_unread_grouped_by_source_and_consumption_is_not_
     finally:
         conn.close()
 
-    events = feed_backend.get_proactive_events(limit=100)
+    events = feed_backend.prepare_content_items(data_root=tmp_path)
 
     assert len(events) == 60
-    assert [event["source_name"] for event in events] == ["Alpha"] * 30 + ["Beta"] * 30
+    payloads = [event["payload"] for event in events]
+    assert [event["source_name"] for event in payloads] == ["Alpha"] * 30 + ["Beta"] * 30
     for source in ("Alpha", "Beta"):
         timestamps = [
-            event["published_at"] for event in events if event["source_name"] == source
+            event["published_at"] for event in payloads if event["source_name"] == source
         ]
         assert timestamps == sorted(timestamps, reverse=True)
-    assert all("preprocess_score" in event for event in events)
+    assert all("preprocess_score" in event for event in payloads)
+    assert payloads[0]["content"].startswith("content-")
 
     consumed = expected[0]
-    feed_backend.acknowledge_events([consumed])
+    result = feed_backend.settle_content_item(
+        consumed, "hash-0", data_root=tmp_path
+    )
+    assert result == {"status": "committed", "disposition": "acknowledged"}
     conn = feed_backend._connect(cfg)
     try:
         row = conn.execute(
@@ -90,19 +95,19 @@ def test_wake_fetch_returns_all_unread_grouped_by_source_and_consumption_is_not_
     assert row["interest_scored_at"] is None
     assert updates == 0
 
-    monkeypatch.setattr(feed_backend, "_now", lambda: now + timedelta(days=10))
     assert consumed not in {
-        event["event_id"] for event in feed_backend.get_proactive_events(limit=100)
+        event["item_id"]
+        for event in feed_backend.prepare_content_items(data_root=tmp_path)
     }
 
 
-def test_wake_fetch_admits_only_content_above_decayed_mass_floor(
+def test_content_export_admits_only_items_above_decayed_mass_floor(
     tmp_path, monkeypatch
 ):
     now = datetime(2026, 7, 12, 12, tzinfo=UTC)
     monkeypatch.setenv("AKA_PLUGIN_DATA_DIR", str(tmp_path))
     monkeypatch.setattr(feed_backend, "_now", lambda: now)
-    cfg = feed_backend.load_config()
+    cfg = feed_backend.load_config(tmp_path)
     conn = feed_backend._connect(cfg)
     try:
         conn.executemany(
@@ -129,9 +134,9 @@ def test_wake_fetch_admits_only_content_above_decayed_mass_floor(
     finally:
         conn.close()
 
-    events = feed_backend.get_proactive_events()
+    events = feed_backend.prepare_content_items(data_root=tmp_path)
 
-    assert [event["event_id"] for event in events] == ["fresh"]
+    assert [event["item_id"] for event in events] == ["fresh"]
 
     conn = feed_backend._connect(cfg)
     try:
@@ -141,13 +146,47 @@ def test_wake_fetch_admits_only_content_above_decayed_mass_floor(
     assert remaining == 3
 
 
+def test_content_export_freezes_rank_payload_and_obsolete_ack_keeps_new_revision(
+    tmp_path, monkeypatch
+):
+    now = datetime(2026, 7, 12, 12, tzinfo=UTC)
+    monkeypatch.setattr(feed_backend, "_now", lambda: now)
+    cfg = feed_backend.load_config(tmp_path)
+    conn = feed_backend._connect(cfg)
+    try:
+        _insert_item(conn, index=1, source="Alpha", published_at=now)
+        conn.commit()
+    finally:
+        conn.close()
+
+    first = feed_backend.prepare_content_items(data_root=tmp_path)
+    monkeypatch.setattr(feed_backend, "_now", lambda: now + timedelta(hours=12))
+    repeated = feed_backend.prepare_content_items(data_root=tmp_path)
+    assert repeated == first
+
+    conn = feed_backend._connect(cfg)
+    try:
+        conn.execute(
+            "UPDATE items SET content='changed', content_hash='hash-new' WHERE event_id='event-001'"
+        )
+        conn.execute("DELETE FROM acked_items WHERE event_id='event-001'")
+        conn.commit()
+    finally:
+        conn.close()
+    assert feed_backend.settle_content_item(
+        "event-001", "hash-1", data_root=tmp_path
+    ) == {"status": "committed", "disposition": "obsolete_revision"}
+    current = feed_backend.prepare_content_items(data_root=tmp_path)
+    assert [item["revision"] for item in current] == ["hash-new"]
+
+
 def test_missing_publication_requires_strong_interest_to_enter_transport():
-    assert feed_backend._wake_admission_score(
+    assert feed_backend._content_admission_score(
         {"interest": 0.45, "freshness": 0.03}
-    ) < feed_backend._WAKE_ADMISSION_FLOOR
-    assert feed_backend._wake_admission_score(
+    ) < feed_backend._CONTENT_ADMISSION_FLOOR
+    assert feed_backend._content_admission_score(
         {"interest": 0.9, "freshness": 0.03}
-    ) > feed_backend._WAKE_ADMISSION_FLOOR
+    ) > feed_backend._CONTENT_ADMISSION_FLOOR
 
 
 def test_feedparser_reads_rfc2822_namespace_date_and_stable_entry_id():

@@ -1,6 +1,6 @@
 schema_version = 1
 name = "feed"
-version = "3.0.0"
+version = "3.1.0"
 api_version = 3
 entrypoint = "plugin.py"
 
@@ -16,12 +16,20 @@ exclude_data_paths = [
   "feed_cache.db",
   "feed_cache.db-wal",
   "feed_cache.db-shm",
+  "feed_mcp.runtime.log",
+  "feed_mcp.runtime.log.1",
+  "feed_mcp.runtime.log.2",
+  "feed_mcp.runtime.log.3",
+  "feed_source.runtime.log",
+  "feed_source.runtime.log.1",
+  "feed_source.runtime.log.2",
+  "feed_source.runtime.log.3",
   ".feed-v2-migration.json",
 ]
 
 [[mcp]]
 name = "feed"
 command = ["python", "mcp/run_mcp.py"]
-required_tools = ["get_proactive_events", "acknowledge_events"]
-candidate_read_only_tools = ["get_proactive_events"]
+required_tools = ["feed_manage", "feed_query"]
+candidate_read_only_tools = []
 candidate_env = {FEED_BACKEND = "recording"}

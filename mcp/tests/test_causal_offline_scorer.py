@@ -9,7 +9,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from scripts.causal_offline_scorer import score_databases
-from src import feed_backend
+from feed_runtime import backend as feed_backend
 
 
 def _create_db(path: Path) -> sqlite3.Connection:

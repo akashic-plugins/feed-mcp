@@ -1,10 +1,10 @@
 """
-feed-mcp backend
+Feed domain backend shared by the MCP adapter and Content source runtime.
 
 最小实现：
 1. 用 sqlite 管理订阅源和条目
 2. 按需轮询 RSS/Atom
-3. 对外提供 proactive content 事件与基础管理查询能力
+3. 对外提供 Content 条目与基础管理查询能力
 """
 
 from __future__ import annotations
@@ -60,27 +60,46 @@ class FeedMcpConfig:
 
 
 def _config_path() -> Path:
-    return Path(__file__).resolve().parent.parent / "feed_mcp.json"
+    return Path(__file__).resolve().parent.parent / "mcp" / "feed_mcp.json"
 
 
-def _runtime_root() -> Path:
-    raw = os.environ.get("AKA_PLUGIN_DATA_DIR", "").strip()
-    if not raw:
-        raise RuntimeError("feed backend 缺少 AKA_PLUGIN_DATA_DIR")
-    path = Path(raw).expanduser()
+def _runtime_root(data_root: Path | None = None) -> Path:
+    if data_root is None:
+        raw = os.environ.get("AKA_PLUGIN_DATA_DIR", "").strip()
+        if not raw:
+            raise RuntimeError("feed backend 缺少 AKA_PLUGIN_DATA_DIR")
+        path = Path(raw).expanduser()
+    else:
+        path = data_root.expanduser()
     path.mkdir(parents=True, exist_ok=True)
     return path
 
 
-def load_config() -> FeedMcpConfig:
-    runtime_root = _runtime_root()
+def _config_values() -> dict[str, Any]:
     raw = dict(_DEFAULT_CONFIG)
     path = _config_path()
     if path.exists():
         raw.update(json.loads(path.read_text()))
+    return raw
+
+
+def _database_path(data_root: Path, raw: dict[str, Any]) -> Path:
     db_path = Path(str(raw["db_path"]))
     if not db_path.is_absolute():
-        db_path = (runtime_root / db_path).resolve()
+        db_path = (data_root.expanduser() / db_path).resolve()
+    return db_path
+
+
+def provider_database_path(data_root: Path) -> Path:
+    """Resolve the configured Feed database without creating runtime state."""
+
+    return _database_path(data_root, _config_values())
+
+
+def load_config(data_root: Path | None = None) -> FeedMcpConfig:
+    runtime_root = _runtime_root(data_root)
+    raw = _config_values()
+    db_path = _database_path(runtime_root, raw)
     return FeedMcpConfig(
         db_path=db_path,
         poll_ttl_seconds=max(60, int(raw["poll_ttl_seconds"])),
@@ -208,6 +227,17 @@ def _connect(cfg: FeedMcpConfig) -> sqlite3.Connection:
             error REAL NOT NULL,
             feature_count INTEGER NOT NULL,
             updated_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS content_exports (
+            event_id TEXT NOT NULL,
+            content_hash TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY(event_id, content_hash)
         )
         """
     )
@@ -1034,8 +1064,7 @@ def feed_query(
     conn = _connect(cfg)
     try:
         trace_id = _trace_id_short()
-        # 1. 只读缓存查询：不主动拉取（拉取由 MCP lifespan 的后台 FeedPoller
-        #    按 poll_ttl_seconds 周期执行，或通过 poll_feeds 显式触发）。
+        # 1. 只读缓存查询：不主动拉取（拉取由插件 Timer 统一触发）。
         enabled_rows = conn.execute(
             "SELECT * FROM sources WHERE enabled = 1 ORDER BY added_at DESC"
         ).fetchall()
@@ -1168,10 +1197,10 @@ def feed_query(
 
 
 def _build_display_text(row: sqlite3.Row) -> str:
-    """为单条 item 生成预格式化展示文本，供 proactive LLM 直接使用。
+    """为单条 item 生成稳定展示文本，供 Content 消费方直接使用。
 
-    MCP 侧控制格式，proactive 侧无需感知内容类型细节。
-    url 同时保留在独立字段，proactive 会兜底追加以保证溯源链完整。
+    Feed 侧控制格式，消费方无需感知内容类型细节。
+    url 同时保留在独立字段，保证溯源链完整。
     """
     source = (row["source_name"] or "").strip()
     title = (row["title"] or "（无标题）").strip()
@@ -1195,7 +1224,7 @@ _RECENT_CONTEXT_LIMIT = 100
 _SOURCE_DIVERSITY_DECAY = 0.5
 _SOURCE_DIVERSITY_FLOOR = 0.05
 _MISSING_PUBLICATION_CONFIDENCE = 0.03
-_WAKE_ADMISSION_FLOOR = 0.02
+_CONTENT_ADMISSION_FLOOR = 0.02
 
 
 def _tokenize_rank_text(*parts: object) -> list[str]:
@@ -1395,7 +1424,7 @@ def _freshness_score(row: sqlite3.Row, cfg: FeedMcpConfig, now: datetime) -> tup
     )
 
 
-def _wake_admission_score(features: dict[str, float]) -> float:
+def _content_admission_score(features: dict[str, float]) -> float:
     interest = min(0.999, max(0.0, float(features.get("interest", 0.0))))
     freshness = min(1.0, max(0.0, float(features.get("freshness", 0.0))))
     return -math.log1p(-interest) * freshness
@@ -1758,13 +1787,10 @@ def _record_rank_impressions(
         )
 
 
-def poll_feeds_only() -> None:
-    """按需轮询所有启用源（尊重 poll_ttl_seconds），不返回内容。
-    由 MCP lifespan 按固定周期调用，与 get_proactive_events 完全解耦。
-    单源失败已在 _poll_rows 内部隔离；系统级异常（DB 不可用、配置损坏等）直接上抛，
-    由调用方决定如何处理，避免故障被静默吞掉。
-    """
-    cfg = load_config()
+def poll_feeds_only(*, data_root: Path | None = None) -> None:
+    """Poll every due Feed source once and preserve per-source outcomes."""
+
+    cfg = load_config(data_root)
     conn = _connect(cfg)
     try:
         trace_id = _trace_id_short()
@@ -1786,11 +1812,13 @@ def poll_feeds_only() -> None:
         conn.close()
 
 
-def get_proactive_events(*, offset: int = 0, limit: int = 50) -> list[dict[str, Any]]:
-    cfg = load_config()
+def prepare_content_items(*, data_root: Path) -> tuple[dict[str, object], ...]:
+    """Freeze complete current revisions for idempotent Content submission."""
+
+    cfg = load_config(data_root)
     conn = _connect(cfg)
     try:
-        # 纯 DB 查询，不触发轮询。MCP lifespan 独立维护缓存 freshness。
+        # 1. Rank every current unacknowledged item.
         now = _now()
         rows = conn.execute(
             """
@@ -1804,7 +1832,8 @@ def get_proactive_events(*, offset: int = 0, limit: int = 50) -> list[dict[str, 
                 i.url,
                 i.author,
                 i.published_at,
-                i.first_seen_at
+                i.first_seen_at,
+                i.content_hash
             FROM items i
             LEFT JOIN acked_items a ON a.event_id = i.event_id
             WHERE a.event_id IS NULL
@@ -1819,97 +1848,588 @@ def get_proactive_events(*, offset: int = 0, limit: int = 50) -> list[dict[str, 
         admitted = []
         for row in rows:
             score, features = ranked_by_id.get(str(row["event_id"]), (0.0, {}))
-            admission_score = _wake_admission_score(features)
-            if admission_score < _WAKE_ADMISSION_FLOOR:
+            admission_score = _content_admission_score(features)
+            if admission_score < _CONTENT_ADMISSION_FLOOR:
                 continue
             visible_features = dict(features)
-            visible_features["wake_admission_score"] = admission_score
+            visible_features["content_admission_score"] = admission_score
             admitted.append((row, score, visible_features))
-        selected = admitted[max(0, offset):max(0, offset) + max(1, limit)]
-        return [
-            {
-                "event_id": row["event_id"],
+
+        # 2. Freeze one complete payload for each exact content revision.
+        prepared: list[dict[str, object]] = []
+        for row, score, features in admitted:
+            event_id = str(row["event_id"])
+            revision = str(row["content_hash"])
+            payload = {
                 "kind": "content",
                 "source_type": row["source_type"],
                 "source_id": row["source_id"],
                 "source_name": row["source_name"],
                 "title": row["title"],
+                "content": row["content"],
                 "url": row["url"],
+                "author": row["author"],
                 "published_at": row["published_at"],
                 "first_seen_at": row["first_seen_at"],
                 "preprocess_score": round(score, 6),
                 "preprocess_features": features,
             }
-            for row, score, features in selected
-        ]
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO content_exports(
+                    event_id, content_hash, payload_json, created_at
+                ) VALUES (?, ?, ?, ?)
+                """,
+                (
+                    event_id,
+                    revision,
+                    json.dumps(payload, sort_keys=True, separators=(",", ":")),
+                    now.isoformat(),
+                ),
+            )
+            frozen = conn.execute(
+                """
+                SELECT payload_json FROM content_exports
+                WHERE event_id = ? AND content_hash = ?
+                """,
+                (event_id, revision),
+            ).fetchone()
+            if frozen is None:
+                raise RuntimeError("Feed Content export 冻结失败")
+            frozen_payload = json.loads(str(frozen["payload_json"]))
+            prepared.append(
+                {
+                    "item_id": event_id,
+                    "revision": revision,
+                    "payload": frozen_payload,
+                    "not_before": str(
+                        frozen_payload.get("published_at")
+                        or frozen_payload["first_seen_at"]
+                    ),
+                    "requires_ack": True,
+                }
+            )
+        conn.commit()
+        return tuple(prepared)
     finally:
         conn.close()
 
 
-def _interest_ok_from_feedback(feedback: str | None) -> int | None:
-    if feedback is None or feedback == "consumed":
-        return None
-    if feedback == "interesting":
-        return 1
-    if feedback == "not_interesting":
-        return 0
-    raise ValueError(f"invalid feedback: {feedback}")
+def plan_content_backlog(*, data_root: Path) -> tuple[dict[str, str], ...]:
+    """Read the exact currently admissible Feed backlog without creating state."""
+
+    raw = _config_values()
+    cfg = FeedMcpConfig(
+        db_path=provider_database_path(data_root),
+        poll_ttl_seconds=max(60, int(raw["poll_ttl_seconds"])),
+        item_retention_hours=max(1, int(raw["item_retention_hours"])),
+        max_items_per_source=max(1, int(raw["max_items_per_source"])),
+        max_content_events=max(1, int(raw["max_content_events"])),
+        rank_mode=str(raw["rank_mode"]),
+        rank_impression_limit=max(1, int(raw["rank_impression_limit"])),
+        rank_model_learning_rate=max(0.001, float(raw["rank_model_learning_rate"])),
+    )
+    wal = cfg.db_path.with_name(cfg.db_path.name + "-wal")
+    if wal.is_file() and wal.stat().st_size > 0:
+        raise RuntimeError("Feed provider backlog plan requires a checkpoint")
+    uri = cfg.db_path.resolve().as_uri() + "?mode=ro&immutable=1"
+    conn = sqlite3.connect(uri, uri=True)
+    conn.row_factory = sqlite3.Row
+    try:
+        # 1. Reuse the production admission calculation over a frozen provider DB.
+        _ = conn.execute("PRAGMA query_only = ON")
+        now = _now()
+        rows = conn.execute(
+            """
+            SELECT
+                i.event_id, i.source_id, i.source_type, i.source_name,
+                i.title, i.content, i.url, i.author, i.published_at,
+                i.first_seen_at, i.content_hash
+            FROM items i
+            LEFT JOIN acked_items a ON a.event_id = i.event_id
+            WHERE a.event_id IS NULL
+            ORDER BY i.source_name ASC,
+                     i.published_at IS NULL ASC,
+                     i.published_at DESC,
+                     i.first_seen_at DESC
+            """
+        ).fetchall()
+        ranked = _rank_rows(conn, cfg, list(rows), now)
+        ranked_by_id = {
+            str(row["event_id"]): features for row, _score, features in ranked
+        }
+
+        # 2. Return only stable provider identities in deterministic order.
+        planned = [
+            {
+                "event_id": str(row["event_id"]),
+                "revision": str(row["content_hash"]),
+            }
+            for row in rows
+            if _content_admission_score(
+                ranked_by_id.get(str(row["event_id"]), {})
+            )
+            >= _CONTENT_ADMISSION_FLOOR
+        ]
+        return tuple(sorted(planned, key=lambda item: item["event_id"]))
+    finally:
+        conn.close()
 
 
-def acknowledge_events(
-    event_ids: list[str],
-    feedback: str | None = None,
-) -> dict[str, list[str]]:
-    cfg = load_config()
+def supersede_content_backlog(
+    batch_id: str,
+    items: tuple[dict[str, str], ...],
+    *,
+    data_root: Path,
+) -> dict[str, object]:
+    """Atomically ACK one frozen pre-cutover backlog and retain its receipt."""
+
+    if not batch_id or not items:
+        raise ValueError("Feed cutover supersession requires a non-empty batch")
+    normalized = tuple(
+        sorted(
+            (
+                {"event_id": item["event_id"], "revision": item["revision"]}
+                for item in items
+            ),
+            key=lambda item: item["event_id"],
+        )
+    )
+    items_json = json.dumps(normalized, sort_keys=True, separators=(",", ":"))
+    items_digest = hashlib.sha256(items_json.encode()).hexdigest()
+    cfg = load_config(data_root)
     conn = _connect(cfg)
     now = _now()
-    acked: list[str] = []
-    failed: list[str] = []
     try:
-        interest_ok = _interest_ok_from_feedback(feedback)
-        for event_id in event_ids:
-            try:
-                conn.execute(
-                    """
-                    INSERT INTO acked_items (event_id, acked_at, expires_at)
-                    VALUES (?, ?, ?)
-                    ON CONFLICT(event_id) DO UPDATE SET
-                        acked_at=excluded.acked_at,
-                        expires_at=excluded.expires_at
-                    """,
-                    (
-                        event_id,
-                        now.isoformat(),
-                        (now + timedelta(hours=cfg.item_retention_hours)).isoformat(),
-                    ),
-                )
-                if interest_ok is not None:
-                    conn.execute(
-                        """
-                        UPDATE items
-                        SET interest_ok = ?, interest_scored_at = ?
-                        WHERE event_id = ?
-                        """,
-                        (interest_ok, now.isoformat(), event_id),
-                    )
-                row = conn.execute(
-                    """
-                    SELECT
-                        event_id, source_id, source_name, author, title, content, published_at,
-                        first_seen_at, interest_ok, interest_scored_at
-                    FROM items
-                    WHERE event_id = ?
-                    """,
-                    (event_id,),
-                ).fetchone()
-                if row is not None and interest_ok is not None:
-                    _update_rank_stats_for_row(conn, row, interest_ok, now.isoformat())
-                    _update_rank_model_for_row(conn, cfg, row, interest_ok, now.isoformat())
-                acked.append(event_id)
-            except Exception:
-                logger.exception("feed ack failed: %s", event_id)
-                failed.append(event_id)
+        # 1. Resume only the same completed batch identity.
+        _ensure_legacy_backlog_receipts(conn)
+        existing = conn.execute(
+            "SELECT * FROM legacy_backlog_supersession_receipts WHERE batch_id = ?",
+            (batch_id,),
+        ).fetchone()
+        if existing is not None:
+            if (
+                str(existing["items_digest"]) != items_digest
+                or int(existing["item_count"]) != len(normalized)
+                or str(existing["items_json"]) != items_json
+            ):
+                raise RuntimeError("Feed cutover supersession batch conflict")
+            receipt = _legacy_backlog_receipt(existing)
+            if not _backlog_rows_are_acked(conn, normalized):
+                raise RuntimeError("Feed cutover supersession receipt is unverified")
+            return receipt
+
+        # 2. Lock and reverify every exact provider revision before ACK writes.
         conn.commit()
-        return {"acknowledged": acked, "failed": failed}
+        conn.execute("BEGIN IMMEDIATE")
+        for item in normalized:
+            current = conn.execute(
+                "SELECT content_hash FROM items WHERE event_id = ?",
+                (item["event_id"],),
+            ).fetchone()
+            if current is None or str(current["content_hash"]) != item["revision"]:
+                raise RuntimeError(
+                    f"Feed cutover provider revision changed: {item['event_id']}"
+                )
+
+        # 3. ACK the complete set and commit its durable batch receipt atomically.
+        acked_at = now.isoformat()
+        expires_at = (now + timedelta(hours=cfg.item_retention_hours)).isoformat()
+        conn.executemany(
+            """
+            INSERT INTO acked_items(event_id, acked_at, expires_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(event_id) DO UPDATE SET
+                acked_at=excluded.acked_at,
+                expires_at=excluded.expires_at
+            """,
+            (
+                (item["event_id"], acked_at, expires_at)
+                for item in normalized
+            ),
+        )
+        receipt_id = f"feed-cutover:{items_digest}"
+        conn.execute(
+            """
+            INSERT INTO legacy_backlog_supersession_receipts(
+                batch_id, receipt_id, items_digest, item_count,
+                items_json, committed_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                batch_id,
+                receipt_id,
+                items_digest,
+                len(normalized),
+                items_json,
+                now.isoformat(),
+            ),
+        )
+        conn.commit()
+        row = conn.execute(
+            "SELECT * FROM legacy_backlog_supersession_receipts WHERE batch_id = ?",
+            (batch_id,),
+        ).fetchone()
+        if row is None:
+            raise RuntimeError("Feed cutover supersession receipt commit missing")
+        return _legacy_backlog_receipt(row)
+    finally:
+        conn.close()
+
+
+def verify_content_backlog_supersession(
+    batch_id: str,
+    items: tuple[dict[str, str], ...],
+    *,
+    data_root: Path,
+) -> bool:
+    """Verify the exact batch receipt and every provider suppression row read-only."""
+
+    path = provider_database_path(data_root)
+    wal = path.with_name(path.name + "-wal")
+    if wal.is_file() and wal.stat().st_size > 0:
+        return False
+    uri = path.resolve().as_uri() + "?mode=ro&immutable=1"
+    conn = sqlite3.connect(uri, uri=True)
+    conn.row_factory = sqlite3.Row
+    try:
+        _ = conn.execute("PRAGMA query_only = ON")
+        table = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' "
+            "AND name='legacy_backlog_supersession_receipts'"
+        ).fetchone()
+        if table is None:
+            return False
+        row = conn.execute(
+            "SELECT * FROM legacy_backlog_supersession_receipts WHERE batch_id = ?",
+            (batch_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        normalized = tuple(sorted(items, key=lambda item: item["event_id"]))
+        items_json = json.dumps(normalized, sort_keys=True, separators=(",", ":"))
+        if (
+            str(row["items_json"]) != items_json
+            or str(row["items_digest"])
+            != hashlib.sha256(items_json.encode()).hexdigest()
+            or int(row["item_count"]) != len(normalized)
+        ):
+            return False
+        return _backlog_rows_are_acked(conn, normalized)
+    finally:
+        conn.close()
+
+
+def read_content_backlog_supersession(
+    batch_id: str,
+    *,
+    data_root: Path,
+) -> tuple[dict[str, object], tuple[dict[str, str], ...]] | None:
+    """Read one completed cutover batch and its exact item identities."""
+
+    path = provider_database_path(data_root)
+    wal = path.with_name(path.name + "-wal")
+    if wal.is_file() and wal.stat().st_size > 0:
+        raise RuntimeError("Feed cutover receipt read requires a checkpoint")
+    uri = path.resolve().as_uri() + "?mode=ro&immutable=1"
+    conn = sqlite3.connect(uri, uri=True)
+    conn.row_factory = sqlite3.Row
+    try:
+        _ = conn.execute("PRAGMA query_only = ON")
+        table = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' "
+            "AND name='legacy_backlog_supersession_receipts'"
+        ).fetchone()
+        if table is None:
+            return None
+        row = conn.execute(
+            "SELECT * FROM legacy_backlog_supersession_receipts WHERE batch_id = ?",
+            (batch_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        decoded = json.loads(str(row["items_json"]))
+        if not isinstance(decoded, list):
+            raise RuntimeError("Feed cutover receipt items must be a list")
+        parsed: list[dict[str, str]] = []
+        for item in decoded:
+            if not isinstance(item, dict):
+                raise RuntimeError("Feed cutover receipt item must be an object")
+            event_id = item.get("event_id")
+            revision = item.get("revision")
+            if not isinstance(event_id, str) or not isinstance(revision, str):
+                raise RuntimeError("Feed cutover receipt item identity is invalid")
+            parsed.append({"event_id": event_id, "revision": revision})
+        return _legacy_backlog_receipt(row), tuple(parsed)
+    finally:
+        conn.close()
+
+
+def _ensure_legacy_backlog_receipts(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS legacy_backlog_supersession_receipts(
+            batch_id TEXT PRIMARY KEY,
+            receipt_id TEXT NOT NULL UNIQUE,
+            items_digest TEXT NOT NULL,
+            item_count INTEGER NOT NULL,
+            items_json TEXT NOT NULL,
+            committed_at TEXT NOT NULL
+        )
+        """
+    )
+
+
+def _legacy_backlog_receipt(row: sqlite3.Row) -> dict[str, object]:
+    return {
+        "batch_id": str(row["batch_id"]),
+        "receipt_id": str(row["receipt_id"]),
+        "items_digest": str(row["items_digest"]),
+        "item_count": int(row["item_count"]),
+        "committed_at": str(row["committed_at"]),
+    }
+
+
+def _backlog_rows_are_acked(
+    conn: sqlite3.Connection,
+    items: tuple[dict[str, str], ...],
+) -> bool:
+    return all(
+        conn.execute(
+            "SELECT 1 FROM acked_items a JOIN items i USING(event_id) "
+            "WHERE a.event_id = ? AND i.content_hash = ?",
+            (item["event_id"], item["revision"]),
+        ).fetchone()
+        is not None
+        for item in items
+    )
+
+
+def settle_content_item(
+    event_id: str,
+    revision: str,
+    *,
+    data_root: Path,
+) -> dict[str, str]:
+    """Ensure one exact exported revision is no longer pending in Feed."""
+
+    cfg = load_config(data_root)
+    conn = _connect(cfg)
+    now = _now()
+    try:
+        current = conn.execute(
+            "SELECT content_hash FROM items WHERE event_id = ?", (event_id,)
+        ).fetchone()
+        if current is None:
+            return {"status": "committed", "disposition": "not_pending"}
+        if str(current["content_hash"]) != revision:
+            return {"status": "committed", "disposition": "obsolete_revision"}
+        conn.execute(
+            """
+            INSERT INTO acked_items (event_id, acked_at, expires_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(event_id) DO UPDATE SET
+                acked_at=excluded.acked_at,
+                expires_at=excluded.expires_at
+            """,
+            (
+                event_id,
+                now.isoformat(),
+                (now + timedelta(hours=cfg.item_retention_hours)).isoformat(),
+            ),
+        )
+        conn.commit()
+        return {"status": "committed", "disposition": "acknowledged"}
+    finally:
+        conn.close()
+
+
+def settle_legacy_ack(
+    event_id: str,
+    revision: str,
+    action: str,
+    source_digest: str,
+    *,
+    data_root: Path,
+) -> dict[str, str]:
+    """Commit one legacy Wake ACK and retain its target-owned receipt."""
+
+    cfg = load_config(data_root)
+    conn = _connect(cfg)
+    now = _now()
+    receipt_id = f"feed-legacy-ack:{source_digest}"
+    try:
+        # 1. Reuse a completed handoff without extending the provider ACK.
+        _ensure_legacy_ack_receipts(conn)
+        existing = conn.execute(
+            "SELECT * FROM legacy_ack_handoff_receipts WHERE receipt_id = ?",
+            (receipt_id,),
+        ).fetchone()
+        if existing is not None:
+            identity = tuple(
+                str(existing[field])
+                for field in ("source_digest", "event_id", "revision", "action")
+            )
+            if identity != (source_digest, event_id, revision, action):
+                raise RuntimeError("Feed legacy ACK receipt identity conflict")
+            return _legacy_ack_receipt(existing)
+
+        # 2. Commit one exact provider ACK and its durable receipt atomically.
+        acked_at, expires_at = _commit_legacy_provider_ack(
+            conn, cfg, event_id, revision, now
+        )
+        _insert_legacy_ack_receipt(
+            conn,
+            receipt_id,
+            source_digest,
+            event_id,
+            revision,
+            action,
+            acked_at,
+            expires_at,
+            now,
+        )
+        conn.commit()
+        row = conn.execute(
+            "SELECT * FROM legacy_ack_handoff_receipts WHERE receipt_id = ?",
+            (receipt_id,),
+        ).fetchone()
+        if row is None:
+            raise RuntimeError("Feed legacy ACK receipt commit missing")
+        return _legacy_ack_receipt(row)
+    finally:
+        conn.close()
+
+
+def _ensure_legacy_ack_receipts(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS legacy_ack_handoff_receipts(
+            receipt_id TEXT PRIMARY KEY,
+            source_digest TEXT NOT NULL UNIQUE,
+            event_id TEXT NOT NULL,
+            revision TEXT NOT NULL,
+            action TEXT NOT NULL,
+            acked_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            committed_at TEXT NOT NULL
+        )
+        """
+    )
+
+
+def _commit_legacy_provider_ack(
+    conn: sqlite3.Connection,
+    cfg: FeedMcpConfig,
+    event_id: str,
+    revision: str,
+    now: datetime,
+) -> tuple[str, str]:
+    """Preserve a live provider ACK or establish one new retention window."""
+
+    current = conn.execute(
+        "SELECT content_hash FROM items WHERE event_id = ?", (event_id,)
+    ).fetchone()
+    if current is None:
+        raise RuntimeError(f"Feed legacy ACK provider item missing: {event_id}")
+    if str(current["content_hash"]) != revision:
+        raise RuntimeError(f"Feed legacy ACK revision changed: {event_id}")
+    acknowledgement = conn.execute(
+        "SELECT acked_at, expires_at FROM acked_items WHERE event_id = ?",
+        (event_id,),
+    ).fetchone()
+    if acknowledgement is not None and datetime.fromisoformat(
+        str(acknowledgement["expires_at"])
+    ) > now:
+        return str(acknowledgement["acked_at"]), str(acknowledgement["expires_at"])
+    acked_at = now.isoformat()
+    expires_at = (now + timedelta(hours=cfg.item_retention_hours)).isoformat()
+    conn.execute(
+        """
+        INSERT INTO acked_items(event_id, acked_at, expires_at)
+        VALUES (?, ?, ?)
+        ON CONFLICT(event_id) DO UPDATE SET
+            acked_at=excluded.acked_at,
+            expires_at=excluded.expires_at
+        """,
+        (event_id, acked_at, expires_at),
+    )
+    return acked_at, expires_at
+
+
+def _insert_legacy_ack_receipt(
+    conn: sqlite3.Connection,
+    receipt_id: str,
+    source_digest: str,
+    event_id: str,
+    revision: str,
+    action: str,
+    acked_at: str,
+    expires_at: str,
+    now: datetime,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO legacy_ack_handoff_receipts(
+            receipt_id, source_digest, event_id, revision, action,
+            acked_at, expires_at, committed_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            receipt_id,
+            source_digest,
+            event_id,
+            revision,
+            action,
+            acked_at,
+            expires_at,
+            now.isoformat(),
+        ),
+    )
+
+
+def _legacy_ack_receipt(row: sqlite3.Row) -> dict[str, str]:
+    return {
+        field: str(row[field])
+        for field in (
+            "receipt_id",
+            "source_digest",
+            "event_id",
+            "revision",
+            "action",
+            "acked_at",
+            "expires_at",
+        )
+    }
+
+
+def content_source_deadline(*, data_root: Path, now: datetime) -> datetime:
+    """Return the durable next source deadline, defaulting to immediate work."""
+
+    cfg = load_config(data_root)
+    conn = _connect(cfg)
+    try:
+        row = conn.execute(
+            "SELECT value FROM metadata WHERE key = 'content_source_next_due'"
+        ).fetchone()
+        return now if row is None else datetime.fromisoformat(str(row["value"]))
+    finally:
+        conn.close()
+
+
+def commit_content_source_deadline(*, data_root: Path, deadline: datetime) -> None:
+    """Commit the next source-owned deadline without appending poll history."""
+
+    cfg = load_config(data_root)
+    conn = _connect(cfg)
+    try:
+        conn.execute(
+            """
+            INSERT INTO metadata(key, value) VALUES('content_source_next_due', ?)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value
+            """,
+            (deadline.isoformat(),),
+        )
+        conn.commit()
     finally:
         conn.close()

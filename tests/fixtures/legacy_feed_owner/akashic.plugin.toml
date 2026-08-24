@@ -1,0 +1,14 @@
+schema_version = 1
+name = "feed"
+version = "3.0.0"
+api_version = 3
+entrypoint = "plugin.py"
+
+[[python]]
+requirements = "mcp/requirements.txt"
+
+[[mcp]]
+name = "feed"
+command = ["python", "mcp/run_mcp.py"]
+required_tools = ["legacy_status"]
+candidate_read_only_tools = ["legacy_status"]

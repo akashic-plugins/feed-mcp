@@ -13,8 +13,9 @@ from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from src import feed_backend
+from feed_runtime import backend as feed_backend
 from scripts.recover_published_at import recovery_key
 
 
