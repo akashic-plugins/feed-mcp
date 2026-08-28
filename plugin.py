@@ -19,14 +19,14 @@ class FeedConfig(BaseModel):
     pass
 
 
-CONTENT_SOURCE = ServiceKey[ContentSourceServices]("content.source.v1")
+CONTENT_SOURCE = ServiceKey[ContentSourceServices]("eventmail.content_source.v1")
 
 api_version = 3
 name = "feed"
-version = "3.1.2"
+version = "3.1.3"
 desc = "由 Timer 驱动的 Feed Content source 与用户 MCP"
 Config = FeedConfig
-inject = (MCP_SERVERS, TIMERS, CONTENT_SOURCE)
+inject = (MCP_SERVERS, TIMERS)
 skill_roots = ("skills",)
 
 
@@ -48,16 +48,23 @@ async def apply(ctx: Context, config: object) -> None:
         ),
     )
 
-    # 2. 正式 Root 独占外部轮询与 Content ACK。
-    runtime = FeedContentRuntime(
-        ctx.data_root,
-        ctx.require(TIMERS),
-        ctx.require(CONTENT_SOURCE).bind(CONTENT_SOURCE_ID),
+    # 2. EventMail 存在时，独立子 Fiber 才启动主动来源。
+    async def apply_eventmail(source_ctx: Context) -> None:
+        runtime = FeedContentRuntime(
+            source_ctx.data_root,
+            source_ctx.require(TIMERS),
+            source_ctx.require(CONTENT_SOURCE).bind(CONTENT_SOURCE_ID),
+        )
+
+        def setup() -> object:
+            return runtime.close
+
+        _ = await source_ctx.effect(setup, label="feed-content-source-runtime")
+        _ = await source_ctx.on(RUNTIME_STARTED, lambda _: runtime.start())
+        _ = await source_ctx.on(RUNTIME_STOPPING, lambda _: runtime.close())
+
+    _ = await ctx.inject(
+        (TIMERS, CONTENT_SOURCE),
+        apply_eventmail,
+        name="feed-eventmail-source",
     )
-
-    def setup() -> object:
-        return runtime.close
-
-    _ = await ctx.effect(setup, label="feed-content-source-runtime")
-    _ = await ctx.on(RUNTIME_STARTED, lambda _: runtime.start())
-    _ = await ctx.on(RUNTIME_STOPPING, lambda _: runtime.close())

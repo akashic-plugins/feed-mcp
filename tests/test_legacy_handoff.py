@@ -19,7 +19,7 @@ from agent.migrations.proactive_island import (
     LegacyFactKind,
     apply_handoff,
 )
-from plugins.content.store import ContentIdentityConflict, ContentStore
+from plugins.eventmail.store import EventMailIdentityConflict, EventMailStore
 
 from feed_runtime import backend
 from legacy_handoff import FeedLegacyHandoffAdapter, LEGACY_SOURCE_ID
@@ -30,7 +30,7 @@ TARGET_SOURCE = "feed-subscriptions"
 
 
 class _BoundContent:
-    def __init__(self, store: ContentStore, source_id: str = TARGET_SOURCE) -> None:
+    def __init__(self, store: EventMailStore, source_id: str = TARGET_SOURCE) -> None:
         self.store = store
         self.source_id = source_id
 
@@ -136,10 +136,10 @@ def _seed_provider(data_root: Path, rows: Sequence[Mapping[str, object]]) -> Non
 
 def _fixture(
     tmp_path: Path,
-) -> tuple[Path, ContentStore, _BoundContent, FeedLegacyHandoffAdapter]:
+) -> tuple[Path, EventMailStore, _BoundContent, FeedLegacyHandoffAdapter]:
     data_root = tmp_path / "feed-data"
     _seed_provider(data_root, _legacy_rows())
-    store = ContentStore(tmp_path / "content.sqlite3")
+    store = EventMailStore(tmp_path / "content.sqlite3")
     store.initialize()
     bound = _BoundContent(store)
     return data_root, store, bound, FeedLegacyHandoffAdapter(data_root, bound)
@@ -373,7 +373,7 @@ def test_revision_change_after_target_is_a_batch_conflict(tmp_path: Path) -> Non
     connection.close()
     changed = adapter.plan(fact)
 
-    with pytest.raises(ContentIdentityConflict, match="batch identity conflict"):
+    with pytest.raises(EventMailIdentityConflict, match="batch identity conflict"):
         adapter.apply(fact, changed)
 
     assert store.state_counts() == {"pending": 1}

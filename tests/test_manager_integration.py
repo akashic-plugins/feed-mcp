@@ -15,7 +15,7 @@ import agent.plugins.manager as plugin_manager_module
 from agent.control.timer import TimerReceipt, TimerStatus
 from agent.plugins.manager import PluginManager
 from bus.event_bus import EventBus
-from plugins.content.store import ContentStore
+from plugins.eventmail.store import EventMailStore
 
 from feed_runtime import backend
 
@@ -86,9 +86,9 @@ def _stage_plugins(tmp_path: Path) -> tuple[Path, Path]:
 
     runtime = _fixture_runtime()
     plugins = tmp_path / "plugins"
-    content = plugins / "content"
+    content = plugins / "eventmail"
     feed = plugins / "feed"
-    shutil.copytree(CORE_ROOT / "plugins" / "content", content)
+    shutil.copytree(CORE_ROOT / "plugins" / "eventmail", content)
     shutil.copytree(
         ROOT,
         feed,
@@ -111,9 +111,9 @@ def _stage_legacy_plugins(tmp_path: Path) -> tuple[Path, Path]:
 
     runtime = _fixture_runtime()
     plugins = tmp_path / "plugins"
-    content = plugins / "content"
+    content = plugins / "eventmail"
     feed = plugins / "feed"
-    shutil.copytree(CORE_ROOT / "plugins" / "content", content)
+    shutil.copytree(CORE_ROOT / "plugins" / "eventmail", content)
     shutil.copytree(ROOT / "tests" / "fixtures" / "legacy_feed_owner", feed)
     (feed / "mcp" / ".venv").symlink_to(runtime, target_is_directory=True)
     return content, feed
@@ -241,9 +241,9 @@ async def test_manager_content_candidate_and_timer_handoff(
         formal_timer = next(timer for timer in timers if timer.handles)
         formal_timer.handles[0].fire()
         content_path = (
-            workspace / "plugin-data" / "content-builtin" / "content.sqlite3"
+            workspace / "plugin-data" / "eventmail-builtin" / "eventmail.sqlite3"
         )
-        content_store = ContentStore(content_path)
+        content_store = EventMailStore(content_path)
         await _eventually(
             lambda: content_store.state_counts().get("pending") == 1
         )

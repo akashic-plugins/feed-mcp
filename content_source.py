@@ -10,8 +10,7 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Protocol, cast
 
-from agent.control.timer import TimerHandle, TimerStatus
-from agent.plugin_composition import PluginTimers
+from agent.plugin_composition import PluginTimers, TimerHandle, TimerStatus
 
 from .feed_runtime import CONTENT_SOURCE_ID, backend
 

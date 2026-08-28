@@ -9,6 +9,7 @@ Feed domain backend shared by the MCP adapter and Content source runtime.
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import logging
@@ -119,7 +120,12 @@ def _connect(cfg: FeedMcpConfig) -> sqlite3.Connection:
     conn = sqlite3.connect(cfg.db_path, timeout=30)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA busy_timeout=30000")
-    conn.execute("PRAGMA journal_mode=WAL")
+    # SQLite does not wait reliably when two processes first enable WAL.
+    # Serialize only that one-time database mode transition.
+    lock_path = cfg.db_path.with_suffix(cfg.db_path.suffix + ".init.lock")
+    with lock_path.open("a+b") as init_lock:
+        fcntl.flock(init_lock, fcntl.LOCK_EX)
+        conn.execute("PRAGMA journal_mode=WAL")
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS sources (
