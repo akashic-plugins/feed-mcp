@@ -1019,6 +1019,7 @@ def feed_manage(action: str, name: str = "", url: str = "", source_type: str = "
     cfg = load_config()
     conn = _connect(cfg)
     try:
+        action = action.strip().lower()
         if action == "list":
             rows = conn.execute(
                 "SELECT name, type, url, enabled, note FROM sources ORDER BY added_at DESC"
@@ -1085,7 +1086,61 @@ def feed_manage(action: str, name: str = "", url: str = "", source_type: str = "
             )
             conn.commit()
             return f"已订阅 {name.strip()!r}（类型={source_type or 'rss'} {normalized_url}），下次主动巡检时开始收集"
-        return "错误：action 必须是 subscribe|list|unsubscribe"
+
+        if action in {"pause", "resume", "update"}:
+            exact_name = name.strip()
+            if not exact_name:
+                return f"错误：{action} 需要 name"
+            rows = conn.execute(
+                "SELECT id, name, url, enabled FROM sources WHERE lower(name) = lower(?)",
+                (exact_name,),
+            ).fetchall()
+            if not rows:
+                return f"没有找到名称为 {exact_name!r} 的订阅"
+            if len(rows) != 1:
+                return f"错误：名称 {exact_name!r} 对应多个订阅，请先消除重名"
+            source = rows[0]
+            source_id = str(source["id"])
+            now = _now().isoformat()
+
+            if action in {"pause", "resume"}:
+                enabled = 0 if action == "pause" else 1
+                conn.execute(
+                    "UPDATE sources SET enabled = ?, updated_at = ? WHERE id = ?",
+                    (enabled, now, source_id),
+                )
+                conn.commit()
+                verb = "暂停" if action == "pause" else "恢复"
+                return f"已{verb}订阅 {str(source['name'])!r}；历史内容和 ack 记录均已保留"
+
+            if not url.strip():
+                return "错误：update 需要 url"
+            normalized_url = _normalize_source_url(url)
+            duplicate = conn.execute(
+                "SELECT name FROM sources WHERE url = ? AND id != ? LIMIT 1",
+                (normalized_url, source_id),
+            ).fetchone()
+            if duplicate is not None:
+                return f"该地址已被订阅 {str(duplicate['name'])!r} 使用"
+            conn.execute(
+                "UPDATE sources SET url = ?, updated_at = ? WHERE id = ?",
+                (normalized_url, now, source_id),
+            )
+            conn.execute(
+                """
+                UPDATE poll_state
+                SET last_polled_at = NULL, last_success_at = NULL, last_error = NULL
+                WHERE source_id = ?
+                """,
+                (source_id,),
+            )
+            conn.commit()
+            return (
+                f"已更新订阅 {str(source['name'])!r}：{str(source['url'])} -> {normalized_url}；"
+                "历史内容和 ack 记录均已保留"
+            )
+
+        return "错误：action 必须是 subscribe|list|unsubscribe|pause|resume|update"
     finally:
         conn.close()
 
