@@ -27,7 +27,7 @@ def test_runtime_entrypoints_reject_missing_data_dir(
 def test_v3_module_keeps_skill_root_and_identity_exports() -> None:
     assert plugin.api_version == 3
     assert plugin.name == "feed"
-    assert plugin.version == "3.1.2"
+    assert plugin.version == "3.1.3"
     assert plugin.skill_roots == ("skills",)
     assert _config_path() == Path(__file__).resolve().parents[1] / "feed_mcp.json"
 
