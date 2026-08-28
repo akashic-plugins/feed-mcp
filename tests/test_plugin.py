@@ -126,7 +126,7 @@ def test_static_manifest_freezes_tools_and_data_exclusions() -> None:
     manifest = load_static_plugin_manifest(ROOT)
 
     assert manifest.name == "feed"
-    assert manifest.version == "3.1.3"
+    assert manifest.version == plugin.version == "3.1.4"
     assert manifest.api_version == 3
     assert manifest.requirements == ("mcp/requirements.txt",)
     assert "feed_mcp.sqlite3" in manifest.exclude_data_paths
