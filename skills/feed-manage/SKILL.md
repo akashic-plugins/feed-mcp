@@ -62,6 +62,19 @@ mcp_feed__feed_manage(action="subscribe", name="名称", url="RSS地址")
 mcp_feed__feed_manage(action="unsubscribe", name="名称")
 ```
 
+取消订阅会删除该来源的历史内容。只想停止轮询时，使用暂停：
+
+```
+mcp_feed__feed_manage(action="pause", name="完整名称")
+mcp_feed__feed_manage(action="resume", name="完整名称")
+```
+
+更新地址会保留历史内容，并清空旧地址的轮询状态：
+
+```
+mcp_feed__feed_manage(action="update", name="完整名称", url="新 RSS 地址")
+```
+
 ## 注意
 
 - 问"你有什么信息来源"时，先调 `mcp_feed__feed_manage(action=list)` 拿完整列表，再根据列表内容回答，**不得凭记忆或推测列举**
