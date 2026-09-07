@@ -11,8 +11,8 @@ import pytest
 
 from agent.control.timer import TimerReceipt, TimerStatus
 from agent.plugin_composition import PluginTimers
-from feed_test_plugin.content_source import FeedContentRuntime
-from feed_runtime import backend
+from feed_test_plugin.content_source import FeedContentRuntime  # pyright: ignore[reportMissingImports]
+from feed_test_plugin.feed_runtime import backend  # pyright: ignore[reportMissingImports]
 
 
 class _TimerHandle:
@@ -107,8 +107,10 @@ def _seed_item(data_root: Path, now: datetime) -> None:
 @pytest.mark.asyncio
 async def test_timer_poll_submits_nonempty_once_and_empty_poll_has_no_history(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     now = datetime(2026, 8, 23, 10, tzinfo=UTC)
+    monkeypatch.setattr(backend, "_now", lambda: now)
     timer = _Timer(now)
     content = _Content()
     _seed_item(tmp_path, now)

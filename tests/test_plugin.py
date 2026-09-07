@@ -6,7 +6,7 @@ from typing import cast
 
 import pytest
 
-from feed_test_plugin import plugin
+from feed_test_plugin import plugin  # pyright: ignore[reportMissingImports]
 from agent.control.timer import OneShotTimer
 from agent.plugin_composition import (
     MCP_SERVERS,
@@ -20,9 +20,12 @@ from agent.plugin_composition.mcp_slots import (
     _freeze_plugin_mcp_servers,
 )
 from agent.plugins.composable import ComposablePlugin
-from agent.plugins.manager import _copy_validation_data
+from agent.plugins.manager import _copy_validation_tree
 from agent.plugins.static_manifest import load_static_plugin_manifest
-from feed_test_plugin.content_source import BoundContentSource, ContentSourceServices
+from feed_test_plugin.content_source import (  # pyright: ignore[reportMissingImports]
+    BoundContentSource,
+    ContentSourceServices,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -72,9 +75,11 @@ async def test_apply_registers_user_mcp_and_dormant_content_runtime(
     )
     await root.context.provide(plugin.CONTENT_SOURCE, sources)
     data_dir = tmp_path / "plugin-data"
+    composable = ComposablePlugin.from_module(plugin)
     await root.mount(
-        ComposablePlugin.from_module(plugin),
+        composable.apply,
         name="feed",
+        inject=composable.inject,
         runtime=PluginRuntime(
             plugin_id="feed",
             generation_id="feed:test",
@@ -105,9 +110,11 @@ async def test_apply_keeps_user_mcp_without_eventmail(tmp_path: Path) -> None:
     servers = PluginMcpServers(root.instance_token)
     await root.context.provide(MCP_SERVERS, servers)
     await root.context.provide(TIMERS, PluginTimers.candidate_validation())
+    composable = ComposablePlugin.from_module(plugin)
     await root.mount(
-        ComposablePlugin.from_module(plugin),
+        composable.apply,
         name="feed",
+        inject=composable.inject,
         runtime=PluginRuntime(
             plugin_id="feed",
             generation_id="feed:without-eventmail",
@@ -149,7 +156,7 @@ def test_candidate_copy_excludes_sqlite_logs_and_sidecars(tmp_path: Path) -> Non
     (source / "candidate-visible.txt").write_text("visible", encoding="utf-8")
     target = tmp_path / "validation" / "feed"
 
-    inventory = _copy_validation_data(  # pyright: ignore[reportPrivateUsage]
+    inventory = _copy_validation_tree(  # pyright: ignore[reportPrivateUsage]
         source,
         target,
         manifest.exclude_data_paths,

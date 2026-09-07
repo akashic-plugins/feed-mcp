@@ -14,6 +14,8 @@ import pytest
 import agent.plugins.manager as plugin_manager_module
 from agent.control.timer import TimerReceipt, TimerStatus
 from agent.plugins.manager import PluginManager
+from agent.plugins.python_environment import ENVIRONMENT_FILE, PythonEnvironments
+from agent.plugins.static_manifest import load_static_plugin_manifest
 from bus.event_bus import EventBus
 from plugins.eventmail.store import EventMailStore
 
@@ -140,6 +142,18 @@ def _replace_with_current_feed(feed: Path) -> None:
     (feed / "mcp" / ".venv").symlink_to(runtime, target_is_directory=True)
 
 
+def _prepare_python_environment(source: Path, workspace: Path) -> None:
+    """通过安装 owner 为测试 artifact 固定独立 Python 环境。"""
+
+    manifest = load_static_plugin_manifest(source)
+    environments = PythonEnvironments(workspace)
+    refs = {
+        item.runtime_root: environments.prepare(source, item)
+        for item in manifest.python
+    }
+    (source / ENVIRONMENT_FILE).write_text(json.dumps(refs), encoding="utf-8")
+
+
 def test_stage_plugins_uses_explicit_fixture_runtime(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -203,7 +217,7 @@ async def test_manager_content_candidate_and_timer_handoff(
     """证明唯一正式轮询 owner、静默候选和有序热更新。"""
 
     # 1. 加载真实插件，让稳定 Feed Root 提交一条完整 item。
-    now = datetime(2026, 8, 23, 10, tzinfo=UTC)
+    now = datetime.now(UTC)
     timers: list[_Timer] = []
 
     def timer_factory() -> _Timer:
@@ -214,6 +228,7 @@ async def test_manager_content_candidate_and_timer_handoff(
     monkeypatch.setattr(plugin_manager_module, "AsyncioOneShotTimer", timer_factory)
     content_dir, feed_dir = _stage_plugins(tmp_path)
     workspace = tmp_path / "workspace"
+    _prepare_python_environment(feed_dir, workspace)
     manager = PluginManager(
         plugin_dirs=[content_dir, feed_dir],
         event_bus=EventBus(),
@@ -232,6 +247,10 @@ async def test_manager_content_candidate_and_timer_handoff(
         "feed_manage",
         "feed_query",
     )
+    async with runtime.mcp.server("feed").route() as route:
+        call = await route.call("feed_query", {"action": "catalog"})
+        assert call.success
+        assert call.output == "没有匹配的启用订阅"
     feed_data = workspace / "plugin-data" / "feed-builtin"
     _seed_item(feed_data, now)
     lifecycle = asyncio.create_task(manager.run_runtime_services())
@@ -262,6 +281,7 @@ async def test_manager_content_candidate_and_timer_handoff(
         content_hashes = _sqlite_hashes(content_path)
         with (feed_dir / "plugin.py").open("a", encoding="utf-8") as handle:
             handle.write("\n# candidate handoff fixture\n")
+        _prepare_python_environment(feed_dir, workspace)
         candidate = await manager.prepare_candidate("feed")
         assert candidate is not None and candidate.runtime_snapshot is not None
         candidate_root = candidate.runtime_snapshot.composition_root
@@ -313,6 +333,7 @@ async def test_legacy_mcp_owner_stops_before_new_timer_starts(
     monkeypatch.setattr(plugin_manager_module, "AsyncioOneShotTimer", timer_factory)
     content_dir, feed_dir = _stage_legacy_plugins(tmp_path)
     workspace = tmp_path / "workspace"
+    _prepare_python_environment(feed_dir, workspace)
     manager = PluginManager(
         plugin_dirs=[content_dir, feed_dir],
         event_bus=EventBus(),
@@ -330,6 +351,7 @@ async def test_legacy_mcp_owner_stops_before_new_timer_starts(
 
         # 2. 准备并发布真实 Timer + Content 实现。
         _replace_with_current_feed(feed_dir)
+        _prepare_python_environment(feed_dir, workspace)
         candidate = await manager.prepare_candidate("feed")
         assert candidate is not None
         assert sum(len(timer.handles) for timer in timers) == 0
