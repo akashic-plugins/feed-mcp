@@ -1,0 +1,83 @@
+[
+  {
+    "name": "feed_manage",
+    "description": "管理 RSS 订阅源：添加、删除、列出、暂停、恢复或更新地址。",
+    "parameters": {
+      "properties": {
+        "action": {
+          "title": "Action",
+          "type": "string"
+        },
+        "name": {
+          "default": "",
+          "title": "Name",
+          "type": "string"
+        },
+        "url": {
+          "default": "",
+          "title": "Url",
+          "type": "string"
+        },
+        "source_type": {
+          "default": "rss",
+          "title": "Source Type",
+          "type": "string"
+        },
+        "note": {
+          "default": "",
+          "title": "Note",
+          "type": "string"
+        }
+      },
+      "required": [
+        "action"
+      ],
+      "title": "feed_manageArguments",
+      "type": "object"
+    },
+    "read_only": false
+  },
+  {
+    "name": "feed_query",
+    "description": "查询由唯一 Timer owner 维护的 RSS 缓存。",
+    "parameters": {
+      "properties": {
+        "action": {
+          "title": "Action",
+          "type": "string"
+        },
+        "source": {
+          "default": "",
+          "title": "Source",
+          "type": "string"
+        },
+        "keyword": {
+          "default": "",
+          "title": "Keyword",
+          "type": "string"
+        },
+        "limit": {
+          "default": 5,
+          "title": "Limit",
+          "type": "integer"
+        },
+        "page": {
+          "default": 1,
+          "title": "Page",
+          "type": "integer"
+        },
+        "page_size": {
+          "default": 20,
+          "title": "Page Size",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "action"
+      ],
+      "title": "feed_queryArguments",
+      "type": "object"
+    },
+    "read_only": true
+  }
+]

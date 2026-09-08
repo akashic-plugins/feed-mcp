@@ -59,3 +59,7 @@ CI 固定 Core `065dfb7fb37534c57ed500b1ed9b5deb7090cdb0`，运行单元测试�
 Manager + stdio MCP + Content + Timer fixture、pyright、compileall 和
 `git diff --check`。Manager fixture 还证明：候选零 Timer/零正式写，发布时旧
 Timer 已取消后新稳定 Root 才接班。
+
+### 用户工具发现
+
+`plugin.py` 向 `TOOLS` 注册用户工具，保留 `mcp_feed__` 名称。目录来自 MCP `tools/list`，加载插件不会启动 MCP；实际调用才打开本插件的 MCP 路由。服务端负责参数校验，MCP 工具错误和传输失败保留原语义。修改 MCP 签名或描述时同步更新 `tool_catalog.json`。
