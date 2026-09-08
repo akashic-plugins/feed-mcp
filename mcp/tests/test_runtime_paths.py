@@ -27,9 +27,95 @@ def test_runtime_entrypoints_reject_missing_data_dir(
 def test_v3_module_keeps_skill_root_and_identity_exports() -> None:
     assert plugin.api_version == 3
     assert plugin.name == "feed"
-    assert plugin.version == "3.1.3"
+    assert plugin.version == "3.1.4"
     assert plugin.skill_roots == ("skills",)
     assert _config_path() == Path(__file__).resolve().parents[1] / "feed_mcp.json"
+
+
+def test_feed_manage_pause_resume_and_update_preserve_history(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AKA_PLUGIN_DATA_DIR", str(tmp_path))
+    assert "已订阅" in feed_backend.feed_manage(
+        action="subscribe",
+        name="OpenAI Blog",
+        url="http://localhost:1200/openai/news",
+    )
+    config = feed_backend.load_config()
+    connection = feed_backend._connect(config)
+    try:
+        source = connection.execute(
+            "SELECT id FROM sources WHERE name = 'OpenAI Blog'"
+        ).fetchone()
+        assert source is not None
+        source_id = str(source["id"])
+        connection.execute(
+            """
+            INSERT INTO items (
+                event_id, source_id, source_name, source_type, title, content,
+                first_seen_at, last_seen_at, content_hash
+            ) VALUES ('event-1', ?, 'OpenAI Blog', 'rss', 'title', 'content',
+                      '2026-08-29T00:00:00+00:00', '2026-08-29T00:00:00+00:00', 'hash')
+            """,
+            (source_id,),
+        )
+        connection.execute(
+            """
+            INSERT INTO acked_items (event_id, acked_at, expires_at)
+            VALUES ('event-1', '2026-08-29T00:00:00+00:00', '2026-08-30T00:00:00+00:00')
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO poll_state (source_id, last_polled_at, last_success_at, last_error)
+            VALUES (?, 'old-poll', 'old-success', 'old-error')
+            """,
+            (source_id,),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    assert "已暂停" in feed_backend.feed_manage(action="pause", name="OpenAI Blog")
+    assert "已恢复" in feed_backend.feed_manage(action="resume", name="openai blog")
+    result = feed_backend.feed_manage(
+        action="update",
+        name="OpenAI Blog",
+        url="http://rsshub:1200/openai/news",
+    )
+    assert "已更新" in result
+
+    connection = feed_backend._connect(config)
+    try:
+        source = connection.execute(
+            "SELECT url, enabled FROM sources WHERE id = ?", (source_id,)
+        ).fetchone()
+        assert source is not None
+        assert source["url"] == "http://rsshub:1200/openai/news"
+        assert source["enabled"] == 1
+        assert connection.execute("SELECT COUNT(*) FROM items").fetchone()[0] == 1
+        assert connection.execute("SELECT COUNT(*) FROM acked_items").fetchone()[0] == 1
+        poll_state = connection.execute(
+            "SELECT last_polled_at, last_success_at, last_error FROM poll_state WHERE source_id = ?",
+            (source_id,),
+        ).fetchone()
+        assert poll_state is not None
+        assert tuple(poll_state) == (None, None, None)
+    finally:
+        connection.close()
+
+
+def test_feed_manage_mutations_require_one_exact_name(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AKA_PLUGIN_DATA_DIR", str(tmp_path))
+    assert "已订阅" in feed_backend.feed_manage(
+        action="subscribe", name="OpenAI Blog", url="https://example.com/openai.xml"
+    )
+    assert "没有找到" in feed_backend.feed_manage(action="pause", name="OpenAI")
+    assert "update 需要 url" in feed_backend.feed_manage(action="update", name="OpenAI Blog")
 
 
 def test_concurrent_legacy_connections_share_one_schema_migration(

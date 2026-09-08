@@ -31,7 +31,7 @@ def create_mcp_server() -> FastMCP:
         source_type: str = "rss",
         note: str = "",
     ) -> str:
-        """管理 RSS 订阅源：添加、删除、列出订阅。"""
+        """管理 RSS 订阅源：添加、删除、列出、暂停、恢复或更新地址。"""
 
         return _live_backend().feed_manage(
             action=action,
