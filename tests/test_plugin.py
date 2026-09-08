@@ -4,6 +4,8 @@ import inspect
 from pathlib import Path
 from typing import cast
 
+from plugins.tools.plugin import TOOLS, ToolCatalog
+
 import pytest
 
 from feed_test_plugin import plugin  # pyright: ignore[reportMissingImports]
@@ -54,7 +56,7 @@ class _Sources:
 def test_pure_v3_exports_and_exact_apply() -> None:
     assert plugin.api_version == 3
     assert plugin.name == "feed"
-    assert plugin.version == "3.1.4"
+    assert plugin.version == "3.1.5"
     assert plugin.skill_roots == ("skills",)
     assert tuple(inspect.signature(plugin.apply).parameters) == ("ctx", "config")
     assert ComposablePlugin.from_module(plugin).skill_roots == ("skills",)
@@ -69,6 +71,7 @@ async def test_apply_registers_user_mcp_and_dormant_content_runtime(
     servers = PluginMcpServers(root.instance_token)
     sources = _Sources()
     await root.context.provide(MCP_SERVERS, servers)
+    await root.context.provide(TOOLS, ToolCatalog(root.context))
     await root.context.provide(
         TIMERS,
         PluginTimers(cast(OneShotTimer, object())),
@@ -101,6 +104,7 @@ async def test_apply_registers_user_mcp_and_dormant_content_runtime(
         "serial:runtime.started:feed-eventmail-source",
         "serial:runtime.stopping:feed-eventmail-source",
     )
+    assert any(item["name"].startswith("mcp_feed__") for item in root.context.require(TOOLS).descriptions())
     await root.dispose()
 
 
@@ -109,6 +113,7 @@ async def test_apply_keeps_user_mcp_without_eventmail(tmp_path: Path) -> None:
     root = CompositionRoot("feed:without-eventmail")
     servers = PluginMcpServers(root.instance_token)
     await root.context.provide(MCP_SERVERS, servers)
+    await root.context.provide(TOOLS, ToolCatalog(root.context))
     await root.context.provide(TIMERS, PluginTimers.candidate_validation())
     composable = ComposablePlugin.from_module(plugin)
     await root.mount(
@@ -126,6 +131,7 @@ async def test_apply_keeps_user_mcp_without_eventmail(tmp_path: Path) -> None:
     )
 
     assert "feed" in _freeze_plugin_mcp_servers(servers, root.instance_token)
+    assert any(item["name"].startswith("mcp_feed__") for item in root.context.require(TOOLS).descriptions())
     await root.dispose()
 
 
@@ -133,7 +139,7 @@ def test_static_manifest_freezes_tools_and_data_exclusions() -> None:
     manifest = load_static_plugin_manifest(ROOT)
 
     assert manifest.name == "feed"
-    assert manifest.version == plugin.version == "3.1.4"
+    assert manifest.version == plugin.version == "3.1.5"
     assert manifest.api_version == 3
     assert manifest.requirements == ("mcp/requirements.txt",)
     assert "feed_mcp.sqlite3" in manifest.exclude_data_paths
