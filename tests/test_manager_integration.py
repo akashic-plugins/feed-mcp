@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 import agent.plugins.manager as plugin_manager_module
 from agent.control.timer import TimerReceipt, TimerStatus
+from session.log import MessageLog
 from agent.plugins.manager import PluginManager
 from agent.plugins.python_environment import ENVIRONMENT_FILE, PythonEnvironments
 from agent.plugins.static_manifest import load_static_plugin_manifest
@@ -229,8 +230,10 @@ async def test_manager_content_candidate_and_timer_handoff(
     content_dir, feed_dir = _stage_plugins(tmp_path)
     workspace = tmp_path / "workspace"
     _prepare_python_environment(feed_dir, workspace)
+    log = MessageLog(tmp_path / "sessions.db")
     manager = PluginManager(
-        plugin_dirs=[content_dir, feed_dir],
+        message_log=log,
+        plugin_dirs=[content_dir, feed_dir, CORE_ROOT / "plugins" / "tools"],
         event_bus=EventBus(),
         tool_registry=None,
         workspace=workspace,
@@ -310,6 +313,7 @@ async def test_manager_content_candidate_and_timer_handoff(
         lifecycle.cancel()
         _ = await asyncio.gather(lifecycle, return_exceptions=True)
         await manager.terminate_all()
+        log.close()
 
     assert all(handle.future.done() for timer in timers for handle in timer.handles)
 
@@ -334,8 +338,10 @@ async def test_legacy_mcp_owner_stops_before_new_timer_starts(
     content_dir, feed_dir = _stage_legacy_plugins(tmp_path)
     workspace = tmp_path / "workspace"
     _prepare_python_environment(feed_dir, workspace)
+    log = MessageLog(tmp_path / "sessions.db")
     manager = PluginManager(
-        plugin_dirs=[content_dir, feed_dir],
+        message_log=log,
+        plugin_dirs=[content_dir, feed_dir, CORE_ROOT / "plugins" / "tools"],
         event_bus=EventBus(),
         workspace=workspace,
         installed_cache_root=tmp_path / "cache",
@@ -377,3 +383,4 @@ async def test_legacy_mcp_owner_stops_before_new_timer_starts(
         lifecycle.cancel()
         _ = await asyncio.gather(lifecycle, return_exceptions=True)
         await manager.terminate_all()
+        log.close()
