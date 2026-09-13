@@ -233,7 +233,12 @@ async def test_manager_content_candidate_and_timer_handoff(
     log = MessageLog(tmp_path / "sessions.db")
     manager = PluginManager(
         message_log=log,
-        plugin_dirs=[content_dir, feed_dir, CORE_ROOT / "plugins" / "tools"],
+        plugin_dirs=[
+            content_dir,
+            feed_dir,
+            CORE_ROOT / "plugins" / "content",
+            CORE_ROOT / "plugins" / "tools",
+        ],
         event_bus=EventBus(),
         tool_registry=None,
         workspace=workspace,
@@ -341,7 +346,12 @@ async def test_legacy_mcp_owner_stops_before_new_timer_starts(
     log = MessageLog(tmp_path / "sessions.db")
     manager = PluginManager(
         message_log=log,
-        plugin_dirs=[content_dir, feed_dir, CORE_ROOT / "plugins" / "tools"],
+        plugin_dirs=[
+            content_dir,
+            feed_dir,
+            CORE_ROOT / "plugins" / "content",
+            CORE_ROOT / "plugins" / "tools",
+        ],
         event_bus=EventBus(),
         workspace=workspace,
         installed_cache_root=tmp_path / "cache",
