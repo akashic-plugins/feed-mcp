@@ -11,14 +11,8 @@ from typing import cast
 
 import pytest
 
-from agent.migrations.proactive_island import (
-    HandoffBlocked,
-    HandoffStatus,
-    Inventory,
-    LegacyFact,
-    LegacyFactKind,
-    apply_handoff,
-)
+from feed_handoff import HandoffBlocked, HandoffStatus, apply_handoff
+from feed_handoff_inventory import Inventory, LegacyFact, LegacyFactKind
 from plugins.eventmail.store import EventMailIdentityConflict, EventMailStore
 
 from feed_runtime import backend

@@ -8,14 +8,14 @@ from contextlib import closing
 from pathlib import Path
 from typing import Protocol, cast
 
-from agent.migrations.proactive_island import (
+from feed_handoff import (
     AdapterPlan,
     HandoffBlocked,
     LegacyFact,
-    LegacyFactKind,
     TargetReceipt,
+    receipt_digest,
 )
-from agent.migrations.proactive_island.handoff import receipt_digest
+from feed_handoff_inventory import LegacyFactKind
 
 from feed_runtime import CONTENT_SOURCE_ID, backend
 
