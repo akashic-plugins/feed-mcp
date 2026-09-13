@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Retire an exact legacy Feed backlog without submitting it to Content."""
+"""Retire Feed-owned legacy backlog without submitting it to Content."""
 
 from __future__ import annotations
 
@@ -13,11 +13,8 @@ PLUGIN_ROOT = Path(__file__).resolve().parents[1]
 if str(PLUGIN_ROOT) not in sys.path:
     sys.path.insert(0, str(PLUGIN_ROOT))
 
-from agent.migrations.proactive_island.cli import report_payload, retire
-from agent.migrations.proactive_island.inventory import (
-    inventory_digest,
-    inventory_workspace,
-)
+from feed_handoff import report_payload, retire
+from feed_handoff_inventory import inventory_digest, inventory_workspace
 from legacy_handoff import FeedLegacyHandoffAdapter
 from feed_runtime import backend
 
