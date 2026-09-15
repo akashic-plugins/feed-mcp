@@ -7,14 +7,21 @@ import os
 import shutil
 import sqlite3
 import time
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 import agent.plugins.manager as plugin_manager_module
+from agent.plugin_composition import MCP_SERVERS
+from agent.plugin_composition.bindings import Bindings
+from agent.plugins.snapshot import lease_runtime_snapshot
+from feed_test_plugin.tools import FEED_TOOLS
+from plugins.tools.plugin import TOOLS
 from agent.control.timer import TimerReceipt, TimerStatus
 from session.log import MessageLog
 from agent.plugins.manager import PluginManager
+from agent.plugins.selection import PluginSelection
 from agent.plugins.python_environment import ENVIRONMENT_FILE, PythonEnvironments
 from agent.plugins.static_manifest import load_static_plugin_manifest
 from bus.event_bus import EventBus
@@ -92,6 +99,8 @@ def _stage_plugins(tmp_path: Path) -> tuple[Path, Path]:
     content = plugins / "eventmail"
     feed = plugins / "feed"
     shutil.copytree(CORE_ROOT / "plugins" / "eventmail", content)
+    for provider in ("assets", "content", "mcp"):
+        shutil.copytree(CORE_ROOT / "plugins" / provider, plugins / provider)
     shutil.copytree(
         ROOT,
         feed,
@@ -117,8 +126,9 @@ def _stage_legacy_plugins(tmp_path: Path) -> tuple[Path, Path]:
     content = plugins / "eventmail"
     feed = plugins / "feed"
     shutil.copytree(CORE_ROOT / "plugins" / "eventmail", content)
+    for provider in ("assets", "content", "mcp"):
+        shutil.copytree(CORE_ROOT / "plugins" / provider, plugins / provider)
     shutil.copytree(ROOT / "tests" / "fixtures" / "legacy_feed_owner", feed)
-    (feed / "mcp" / ".venv").symlink_to(runtime, target_is_directory=True)
     return content, feed
 
 
@@ -229,36 +239,44 @@ async def test_manager_content_candidate_and_timer_handoff(
     monkeypatch.setattr(plugin_manager_module, "AsyncioOneShotTimer", timer_factory)
     content_dir, feed_dir = _stage_plugins(tmp_path)
     workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    PluginSelection(workspace).initialize()
     _prepare_python_environment(feed_dir, workspace)
     log = MessageLog(tmp_path / "sessions.db")
     manager = PluginManager(
         message_log=log,
         plugin_dirs=[
-            content_dir,
-            feed_dir,
-            CORE_ROOT / "plugins" / "content",
-            CORE_ROOT / "plugins" / "tools",
+            content_dir, feed_dir, CORE_ROOT / "plugins" / "tools",
+            content_dir.parent / "assets", content_dir.parent / "content",
+            content_dir.parent / "mcp",
         ],
         event_bus=EventBus(),
-        tool_registry=None,
         workspace=workspace,
         installed_cache_root=tmp_path / "cache",
     )
     await manager.load_all()
     snapshot = manager.current_snapshot
-    assert snapshot is not None and snapshot.mcp_server_registry is not None
-    runtime = manager.composition_generation_host.get(
-        snapshot.generations["feed"].generation_id
-    )
-    assert runtime is not None and runtime.mcp is not None
-    assert runtime.mcp.server("feed").tool_names == (
+    assert snapshot is not None and snapshot.composition_root is not None
+    mcp = snapshot.composition_root.context.require(MCP_SERVERS)
+    assert mcp._entries["feed"].definition.required_tools == (
         "feed_manage",
         "feed_query",
     )
-    async with runtime.mcp.server("feed").route() as route:
-        call = await route.call("feed_query", {"action": "catalog"})
-        assert call.success
-        assert call.output == "没有匹配的启用订阅"
+    async with lease_runtime_snapshot(manager.snapshot_store) as leased:
+        lease_root = leased.composition_root
+        assert lease_root is not None
+        bindings = Bindings(log, manager._archive, lease_root)
+        tools = lease_root.context.require(TOOLS)
+        feed_view = lease_root.context.require(FEED_TOOLS)
+        binding = tools.bind(feed_view.select("mcp_feed__feed_query"), bindings)
+
+        async def allow(_binding: str, _arguments: object) -> Mapping[str, object]:
+            return {"allowed": True}
+
+        execution = tools.execution(allow)
+        call = await execution.execute("fixture-query", binding, {"action": "catalog"})
+    assert call.outcome == "success"
+    assert call.parts[0].value == "没有匹配的启用订阅"
     feed_data = workspace / "plugin-data" / "feed-builtin"
     _seed_item(feed_data, now)
     lifecycle = asyncio.create_task(manager.run_runtime_services())
@@ -342,15 +360,15 @@ async def test_legacy_mcp_owner_stops_before_new_timer_starts(
     monkeypatch.setattr(plugin_manager_module, "AsyncioOneShotTimer", timer_factory)
     content_dir, feed_dir = _stage_legacy_plugins(tmp_path)
     workspace = tmp_path / "workspace"
-    _prepare_python_environment(feed_dir, workspace)
+    workspace.mkdir()
+    PluginSelection(workspace).initialize()
     log = MessageLog(tmp_path / "sessions.db")
     manager = PluginManager(
         message_log=log,
         plugin_dirs=[
-            content_dir,
-            feed_dir,
-            CORE_ROOT / "plugins" / "content",
-            CORE_ROOT / "plugins" / "tools",
+            content_dir, feed_dir, CORE_ROOT / "plugins" / "tools",
+            content_dir.parent / "assets", content_dir.parent / "content",
+            content_dir.parent / "mcp",
         ],
         event_bus=EventBus(),
         workspace=workspace,

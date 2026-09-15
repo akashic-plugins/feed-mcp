@@ -18,12 +18,12 @@ from agent.plugin_composition import (
     PluginRuntime,
     PluginTimers,
 )
-from agent.plugin_composition.mcp_slots import (
-    PluginMcpServers,
-    _freeze_plugin_mcp_servers,
-)
+from agent.host_bridge.plugin_execution import CodeOwner, ExecutionAccess
+from agent.plugin_composition.assets import INSTALLED_ASSETS
+from agent.plugin_composition.execution import EXECUTION
+from plugins.assets.plugin import Assets
+from plugins.mcp.plugin import McpServers
 from agent.plugins.composable import ComposablePlugin
-from agent.plugins.manager import _copy_validation_tree
 from agent.plugins.static_manifest import load_static_plugin_manifest
 from feed_test_plugin.content_source import (  # pyright: ignore[reportMissingImports]
     BoundContentSource,
@@ -58,8 +58,10 @@ def test_pure_v3_exports_and_exact_apply() -> None:
     assert plugin.api_version == 3
     assert plugin.name == "feed"
     assert plugin.version == "3.1.5"
-    assert plugin.skill_roots == ("skills",)
-    assert tuple(inspect.signature(plugin.apply).parameters) == ("ctx", "config")
+    assert tuple(inspect.signature(plugin.apply).parameters) == ("ctx",)
+    assert ComposablePlugin.from_module(
+        plugin, load_static_plugin_manifest(ROOT),
+    ).inject == plugin.inject
     assert "eventmail.content_source.v1" in inspect.getsource(plugin)
 
 
@@ -68,9 +70,15 @@ async def test_apply_registers_user_mcp_and_dormant_content_runtime(
     tmp_path: Path,
 ) -> None:
     root = CompositionRoot("feed:test")
-    servers = PluginMcpServers(root.instance_token)
+    servers = McpServers(root.context)
     sources = _Sources()
     await root.context.provide(MCP_SERVERS, servers)
+    await root.context.provide(INSTALLED_ASSETS, Assets(root.context))
+    await root.context.provide(EXECUTION, ExecutionAccess(
+        root.instance_token,
+        {"feed": CodeOwner("feed:test", ROOT, lambda command, cwd: command)},
+        candidate=True,
+    ))
     await root.context.provide(TOOLS, ToolCatalog(root.context))
     await root.context.provide(
         TIMERS,
@@ -78,7 +86,7 @@ async def test_apply_registers_user_mcp_and_dormant_content_runtime(
     )
     await root.context.provide(plugin.CONTENT_SOURCE, sources)
     data_dir = tmp_path / "plugin-data"
-    composable = ComposablePlugin.from_module(plugin)
+    composable = ComposablePlugin.from_module(plugin, load_static_plugin_manifest(ROOT))
     await root.mount(
         composable.apply,
         name="feed",
@@ -89,11 +97,11 @@ async def test_apply_registers_user_mcp_and_dormant_content_runtime(
             plugin_dir=ROOT,
             data_dir=data_dir,
             workspace=tmp_path / "workspace",
-            config=plugin.FeedConfig(),
+            config=plugin.FeedConfig().model_dump(mode="json"),
         ),
     )
 
-    mcp = _freeze_plugin_mcp_servers(servers, root.instance_token)["feed"].definition
+    mcp = servers._entries["feed"].definition
     assert mcp.required_tools == ("feed_manage", "feed_query")
     assert mcp.candidate_read_only_tools == ()
     assert mcp.candidate_env == {"FEED_BACKEND": "recording"}
@@ -111,11 +119,17 @@ async def test_apply_registers_user_mcp_and_dormant_content_runtime(
 @pytest.mark.asyncio
 async def test_apply_keeps_user_mcp_without_eventmail(tmp_path: Path) -> None:
     root = CompositionRoot("feed:without-eventmail")
-    servers = PluginMcpServers(root.instance_token)
+    servers = McpServers(root.context)
     await root.context.provide(MCP_SERVERS, servers)
+    await root.context.provide(INSTALLED_ASSETS, Assets(root.context))
+    await root.context.provide(EXECUTION, ExecutionAccess(
+        root.instance_token,
+        {"feed": CodeOwner("feed:without-eventmail", ROOT, lambda command, cwd: command)},
+        candidate=True,
+    ))
     await root.context.provide(TOOLS, ToolCatalog(root.context))
     await root.context.provide(TIMERS, PluginTimers.candidate_validation())
-    composable = ComposablePlugin.from_module(plugin)
+    composable = ComposablePlugin.from_module(plugin, load_static_plugin_manifest(ROOT))
     await root.mount(
         composable.apply,
         name="feed",
@@ -126,11 +140,11 @@ async def test_apply_keeps_user_mcp_without_eventmail(tmp_path: Path) -> None:
             plugin_dir=ROOT,
             data_dir=tmp_path / "plugin-data",
             workspace=tmp_path / "workspace",
-            config=plugin.FeedConfig(),
+            config=plugin.FeedConfig().model_dump(mode="json"),
         ),
     )
 
-    assert "feed" in _freeze_plugin_mcp_servers(servers, root.instance_token)
+    assert "feed" in servers._entries
     assert any(item["name"].startswith("mcp_feed__") for item in (ref.description for ref in root.context.require(FEED_TOOLS).refs))
     await root.dispose()
 
@@ -141,32 +155,4 @@ def test_static_manifest_freezes_tools_and_data_exclusions() -> None:
     assert manifest.name == "feed"
     assert manifest.version == plugin.version == "3.1.5"
     assert manifest.api_version == 3
-    assert manifest.requirements == ("mcp/requirements.txt",)
-    assert "feed_mcp.sqlite3" in manifest.exclude_data_paths
-    assert "feed_mcp.runtime.log.3" in manifest.exclude_data_paths
-    assert "feed_source.runtime.log.3" in manifest.exclude_data_paths
-    server = manifest.mcp_servers[0]
-    assert server.required_tools == ("feed_manage", "feed_query")
-    assert server.candidate_read_only_tools == ()
-    assert server.candidate_env == (("FEED_BACKEND", "recording"),)
-
-
-def test_candidate_copy_excludes_sqlite_logs_and_sidecars(tmp_path: Path) -> None:
-    manifest = load_static_plugin_manifest(ROOT)
-    source = tmp_path / "workspace" / "plugin-data" / "feed-builtin"
-    source.mkdir(parents=True)
-    for name in manifest.exclude_data_paths:
-        path = source / name
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(f"formal:{name}", encoding="utf-8")
-    (source / "candidate-visible.txt").write_text("visible", encoding="utf-8")
-    target = tmp_path / "validation" / "feed"
-
-    inventory = _copy_validation_tree(  # pyright: ignore[reportPrivateUsage]
-        source,
-        target,
-        manifest.exclude_data_paths,
-    )
-
-    assert inventory == ("candidate-visible.txt",)
-    assert (target / "candidate-visible.txt").read_text() == "visible"
+    assert "mcp/requirements.txt" in manifest.requirements

@@ -1,26 +1,27 @@
 from __future__ import annotations
 
-from agent.plugin_composition import MCP_SERVERS, Context, McpServerDefinition
+import json
+import time
+
+from agent.plugin_composition import RUNTIME_STARTED, RUNTIME_STOPPING, Context
 
 
 api_version = 3
 name = "feed"
 version = "3.0.0"
-desc = "旧 lifespan 轮询 owner 换班 fixture"
-inject = (MCP_SERVERS,)
-skill_roots = ()
+desc = "旧轮询 owner 换班 fixture"
+inject = ()
 
 
-async def apply(ctx: Context, config: object) -> None:
-    """注册一个由 lifespan 拥有后台轮询的旧 MCP。"""
+def _record(ctx: Context, event: str) -> None:
+    root = ctx.data_root
+    root.mkdir(parents=True, exist_ok=True)
+    with (root / "legacy-owner.jsonl").open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps({"event": event, "time_ns": time.time_ns()}) + "\n")
 
-    _ = config
-    await ctx.require(MCP_SERVERS).register(
-        ctx,
-        McpServerDefinition(
-            name="feed",
-            command=("python", "mcp/run_mcp.py"),
-            required_tools=("legacy_status",),
-            candidate_read_only_tools=("legacy_status",),
-        ),
-    )
+
+async def apply(ctx: Context) -> None:
+    """用 runtime 生命周期事件表示旧轮询 owner 的进出。"""
+
+    _ = await ctx.on(RUNTIME_STARTED, lambda _: _record(ctx, "started"))
+    _ = await ctx.on(RUNTIME_STOPPING, lambda _: _record(ctx, "stopped"))

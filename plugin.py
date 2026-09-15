@@ -15,6 +15,7 @@ from agent.plugin_composition import (
     ServiceKey,
 )
 
+from agent.plugin_composition.assets import INSTALLED_ASSETS
 from .content_source import CONTENT_SOURCE_ID, ContentSourceServices, FeedContentRuntime
 
 
@@ -29,15 +30,14 @@ name = "feed"
 version = "3.1.5"
 desc = "由 Timer 驱动的 Feed Content source 与用户 MCP"
 Config = FeedConfig
-inject = (TOOLS, MCP_SERVERS, TIMERS)
-skill_roots = ("skills",)
+inject = (TOOLS, MCP_SERVERS, TIMERS, INSTALLED_ASSETS)
 
 
-async def apply(ctx: Context, config: object) -> None:
+async def apply(ctx: Context) -> None:
     """注册用户 MCP 工具和一个普通 Timer 驱动的 Content source。"""
 
-    if not isinstance(config, FeedConfig):
-        raise TypeError("feed config 必须是 FeedConfig")
+    _ = FeedConfig.model_validate(ctx.config)
+    _ = await ctx.require(INSTALLED_ASSETS).register(ctx, "skills", "skills")
 
     # 1. MCP 只拥有用户触发的订阅管理和缓存查询。
     await ctx.require(MCP_SERVERS).register(
