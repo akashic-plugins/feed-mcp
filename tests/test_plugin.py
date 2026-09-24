@@ -36,6 +36,9 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class _Content:
+    def close(self) -> None:
+        return None
+
     def submit(self, batch_id, items):
         raise AssertionError((batch_id, items))
 
