@@ -5,12 +5,13 @@ from pathlib import Path
 from typing import cast
 
 from plugins.tools.plugin import TOOLS, ToolCatalog
+from agent.plugin_composition.tasks import TaskAdmission
 from feed_test_plugin.tools import FEED_TOOLS
 
 import pytest
 
 from feed_test_plugin import plugin  # pyright: ignore[reportMissingImports]
-from agent.control.timer import OneShotTimer
+from agent.control.timer import AsyncioOneShotTimer
 from agent.plugin_composition import (
     MCP_SERVERS,
     TIMERS,
@@ -66,7 +67,7 @@ def test_pure_v3_exports_and_exact_apply() -> None:
 
 
 @pytest.mark.asyncio
-async def test_apply_registers_user_mcp_and_dormant_content_runtime(
+async def test_apply_registers_user_mcp_and_content_runtime(
     tmp_path: Path,
 ) -> None:
     root = CompositionRoot("feed:test")
@@ -79,10 +80,10 @@ async def test_apply_registers_user_mcp_and_dormant_content_runtime(
         {"feed": CodeOwner("feed:test", ROOT, lambda command, cwd: command)},
         candidate=True,
     ))
-    await root.context.provide(TOOLS, ToolCatalog(root.context))
+    await root.context.provide(TOOLS, ToolCatalog(root.context, cast(TaskAdmission, None)))
     await root.context.provide(
         TIMERS,
-        PluginTimers(cast(OneShotTimer, object())),
+        PluginTimers(AsyncioOneShotTimer()),
     )
     await root.context.provide(plugin.CONTENT_SOURCE, sources)
     data_dir = tmp_path / "plugin-data"
@@ -106,7 +107,7 @@ async def test_apply_registers_user_mcp_and_dormant_content_runtime(
     assert mcp.candidate_read_only_tools == ()
     assert mcp.candidate_env == {"FEED_BACKEND": "recording"}
     assert sources.bound == ["feed-subscriptions"]
-    assert not data_dir.exists()
+    assert data_dir.is_dir()
     topology = root.topology_view()
     assert topology.listeners == (
         "serial:runtime.started:feed-eventmail-source",
@@ -127,7 +128,7 @@ async def test_apply_keeps_user_mcp_without_eventmail(tmp_path: Path) -> None:
         {"feed": CodeOwner("feed:without-eventmail", ROOT, lambda command, cwd: command)},
         candidate=True,
     ))
-    await root.context.provide(TOOLS, ToolCatalog(root.context))
+    await root.context.provide(TOOLS, ToolCatalog(root.context, cast(TaskAdmission, None)))
     await root.context.provide(TIMERS, PluginTimers.candidate_validation())
     composable = ComposablePlugin.from_module(plugin, load_static_plugin_manifest(ROOT))
     await root.mount(
