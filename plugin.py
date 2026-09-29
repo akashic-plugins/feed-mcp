@@ -52,16 +52,20 @@ async def apply(ctx: Context) -> None:
 
     # 2. EventMail 存在时，独立子 Fiber 才启动主动来源。
     async def apply_eventmail(source_ctx: Context) -> None:
+        content = source_ctx.require(CONTENT_SOURCE).bind(CONTENT_SOURCE_ID)
+        _ = await source_ctx.effect(
+            lambda: content.close,
+            label="feed-content-source-binding",
+        )
         runtime = FeedContentRuntime(
             source_ctx.data_root,
             source_ctx.require(TIMERS),
-            source_ctx.require(CONTENT_SOURCE).bind(CONTENT_SOURCE_ID),
+            content,
         )
-
-        def setup() -> object:
-            return runtime.close
-
-        _ = await source_ctx.effect(setup, label="feed-content-source-runtime")
+        _ = await source_ctx.effect(
+            lambda: runtime.close,
+            label="feed-content-source-runtime",
+        )
         _ = await source_ctx.on(RUNTIME_STARTED, lambda _: runtime.start())
         _ = await source_ctx.on(RUNTIME_STOPPING, lambda _: runtime.close())
 

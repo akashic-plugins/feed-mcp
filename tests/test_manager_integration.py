@@ -11,7 +11,12 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
-import agent.plugins.manager as plugin_manager_module
+import agent.plugins.host as plugin_host_module
+from agent.plugin_composition import FiberState, MCP_SERVERS
+from agent.plugin_composition.bindings import BINDINGS
+from agent.plugin_contracts.tools import ALL_TOOLS, TOOLS
+from agent.plugins.selection import PluginSelection
+from plugins.tools.plugin import open_tool
 from agent.control.timer import TimerReceipt, TimerStatus
 from session.log import MessageLog
 from agent.plugins.manager import PluginManager
@@ -99,6 +104,7 @@ def _stage_plugins(tmp_path: Path) -> tuple[Path, Path]:
             ".git",
             ".akashic-core",
             ".plugin-contracts",
+            ".cache",
             ".pytest_cache",
             ".venv",
             "__pycache__",
@@ -134,6 +140,7 @@ def _replace_with_current_feed(feed: Path) -> None:
             ".git",
             ".akashic-core",
             ".plugin-contracts",
+            ".cache",
             ".pytest_cache",
             ".venv",
             "__pycache__",
@@ -211,13 +218,12 @@ def _sqlite_hashes(path: Path) -> dict[str, str]:
 
 
 @pytest.mark.asyncio
-async def test_manager_content_candidate_and_timer_handoff(
+async def test_manager_real_mcp_and_timer_handoff(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """证明唯一正式轮询 owner、静默候选和有序热更新。"""
+    """A live tool call and local replacement keep one formal Feed timer."""
 
-    # 1. 加载真实插件，让稳定 Feed Root 提交一条完整 item。
     now = datetime.now(UTC)
     timers: list[_Timer] = []
 
@@ -226,9 +232,11 @@ async def test_manager_content_candidate_and_timer_handoff(
         timers.append(timer)
         return timer
 
-    monkeypatch.setattr(plugin_manager_module, "AsyncioOneShotTimer", timer_factory)
+    monkeypatch.setattr(plugin_host_module, "AsyncioOneShotTimer", timer_factory)
     content_dir, feed_dir = _stage_plugins(tmp_path)
     workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    PluginSelection(workspace).initialize()
     _prepare_python_environment(feed_dir, workspace)
     log = MessageLog(tmp_path / "sessions.db")
     manager = PluginManager(
@@ -236,75 +244,55 @@ async def test_manager_content_candidate_and_timer_handoff(
         plugin_dirs=[
             content_dir,
             feed_dir,
-            CORE_ROOT / "plugins" / "content",
-            CORE_ROOT / "plugins" / "tools",
+            *(CORE_ROOT / "plugins" / name for name in (
+                "content", "tools", "mcp", "managed_processes",
+            )),
         ],
         event_bus=EventBus(),
-        tool_registry=None,
         workspace=workspace,
         installed_cache_root=tmp_path / "cache",
     )
-    await manager.load_all()
-    snapshot = manager.current_snapshot
-    assert snapshot is not None and snapshot.mcp_server_registry is not None
-    runtime = manager.composition_generation_host.get(
-        snapshot.generations["feed"].generation_id
-    )
-    assert runtime is not None and runtime.mcp is not None
-    assert runtime.mcp.server("feed").tool_names == (
-        "feed_manage",
-        "feed_query",
-    )
-    async with runtime.mcp.server("feed").route() as route:
-        call = await route.call("feed_query", {"action": "catalog"})
-        assert call.success
-        assert call.output == "没有匹配的启用订阅"
-    feed_data = workspace / "plugin-data" / "feed-builtin"
-    _seed_item(feed_data, now)
-    lifecycle = asyncio.create_task(manager.run_runtime_services())
-    formal_reader: sqlite3.Connection | None = None
     try:
+        await manager.load_all()
+        root = manager.live_root
+        old = manager.generation("feed")
+        assert root is not None and old is not None and old.fiber is not None
+        await manager.start_runtime()
         await _eventually(lambda: sum(len(timer.handles) for timer in timers) == 1)
         formal_timer = next(timer for timer in timers if timer.handles)
+
+        refs = root.context.require(ALL_TOOLS)().refs
+        target = next(ref for ref in refs if ref.name == "mcp_feed__feed_query")
+        bindings = root.context.require(BINDINGS)
+        identity = await root.context.require(TOOLS).bind(target, bindings)
+        async with open_tool(bindings, identity) as tool:
+            call = await tool.invoke("catalog", {"action": "catalog"})
+            assert call.outcome == "success"
+            assert "没有匹配的启用订阅" in str(call.parts)
+
+        feed_data = workspace / "plugin-data" / "feed-builtin"
+        _seed_item(feed_data, now)
         formal_timer.handles[0].fire()
-        content_path = (
-            workspace / "plugin-data" / "eventmail-builtin" / "eventmail.sqlite3"
-        )
+        content_path = workspace / "plugin-data" / "eventmail-builtin" / "eventmail.sqlite3"
         content_store = EventMailStore(content_path)
-        await _eventually(
-            lambda: content_store.state_counts().get("pending") == 1
-        )
+        await _eventually(lambda: content_store.state_counts().get("pending") == 1)
         await _eventually(lambda: len(formal_timer.handles) == 2)
         with sqlite3.connect(feed_data / "feed_mcp.sqlite3") as connection:
             assert connection.execute("PRAGMA integrity_check").fetchone() == ("ok",)
-            payload = connection.execute(
-                "SELECT payload_json FROM content_exports"
-            ).fetchone()[0]
+            payload = connection.execute("SELECT payload_json FROM content_exports").fetchone()[0]
         assert '\"content\":\"Body\"' in payload
 
-        # 2. 候选可以握手私有 MCP，但不能轮询或写正式状态。
-        formal_reader = sqlite3.connect(content_path)
-        assert formal_reader.execute("SELECT COUNT(*) FROM items").fetchone() == (1,)
-        feed_hashes = _sqlite_hashes(feed_data / "feed_mcp.sqlite3")
-        content_hashes = _sqlite_hashes(content_path)
         with (feed_dir / "plugin.py").open("a", encoding="utf-8") as handle:
-            handle.write("\n# candidate handoff fixture\n")
+            handle.write("\n# local replacement fixture revision\n")
         _prepare_python_environment(feed_dir, workspace)
-        candidate = await manager.prepare_candidate("feed")
-        assert candidate is not None and candidate.runtime_snapshot is not None
-        candidate_root = candidate.runtime_snapshot.composition_root
-        assert candidate_root is not None
-        assert candidate_root.plugin_runtime("feed").data_dir != feed_data
-        assert sum(len(timer.handles) for timer in timers) == 2
-        assert _sqlite_hashes(feed_data / "feed_mcp.sqlite3") == feed_hashes
-        assert _sqlite_hashes(content_path) == content_hashes
-
-        # 3. 发布先取消旧等待，再由新稳定 Root 注册 Timer。
-        result = await manager.publish_prepared("feed")
-        assert result["publication_state"] == "committed"
-        await _eventually(lambda: sum(len(timer.handles) for timer in timers) == 3)
-        assert content_store.state_counts() == {"pending": 1}
+        result = await manager.reconcile_changed()
+        assert any(row["publication_state"] == "active" for row in result)
+        assert manager.generation("feed") is not old
+        assert old.scope.closed
+        assert manager.live_root is root
+        await _eventually(lambda: len(formal_timer.handles) == 3)
         assert (await formal_timer.handles[1].result()).status is TimerStatus.CANCELLED
+        assert content_store.state_counts() == {"pending": 1}
         active = [
             handle
             for timer in timers
@@ -313,10 +301,6 @@ async def test_manager_content_candidate_and_timer_handoff(
         ]
         assert len(active) == 1
     finally:
-        if formal_reader is not None:
-            formal_reader.close()
-        lifecycle.cancel()
-        _ = await asyncio.gather(lifecycle, return_exceptions=True)
         await manager.terminate_all()
         log.close()
 
@@ -324,13 +308,12 @@ async def test_manager_content_candidate_and_timer_handoff(
 
 
 @pytest.mark.asyncio
-async def test_legacy_mcp_owner_stops_before_new_timer_starts(
+async def test_legacy_mcp_owner_drains_before_new_timer_starts(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """证明旧 lifespan owner 退场后，Timer ownership 才开始。"""
+    """A replacement waits for the old session before the new source schedules."""
 
-    # 1. 启动真实 managed MCP，用 lifespan 表示旧轮询 owner。
     now = datetime(2026, 8, 23, 10, tzinfo=UTC)
     timers: list[_Timer] = []
 
@@ -339,9 +322,11 @@ async def test_legacy_mcp_owner_stops_before_new_timer_starts(
         timers.append(timer)
         return timer
 
-    monkeypatch.setattr(plugin_manager_module, "AsyncioOneShotTimer", timer_factory)
+    monkeypatch.setattr(plugin_host_module, "AsyncioOneShotTimer", timer_factory)
     content_dir, feed_dir = _stage_legacy_plugins(tmp_path)
     workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    PluginSelection(workspace).initialize()
     _prepare_python_environment(feed_dir, workspace)
     log = MessageLog(tmp_path / "sessions.db")
     manager = PluginManager(
@@ -349,38 +334,53 @@ async def test_legacy_mcp_owner_stops_before_new_timer_starts(
         plugin_dirs=[
             content_dir,
             feed_dir,
-            CORE_ROOT / "plugins" / "content",
-            CORE_ROOT / "plugins" / "tools",
+            *(CORE_ROOT / "plugins" / name for name in (
+                "content", "tools", "mcp", "managed_processes",
+            )),
         ],
         event_bus=EventBus(),
         workspace=workspace,
         installed_cache_root=tmp_path / "cache",
     )
-    await manager.load_all()
-    owner_log = (
-        workspace / "plugin-data" / "feed-builtin" / "legacy-owner.jsonl"
-    )
-    await _eventually(owner_log.is_file)
-    lifecycle = asyncio.create_task(manager.run_runtime_services())
+    release = asyncio.Event()
+    opened = asyncio.Event()
+    session: asyncio.Task[None] | None = None
+    replacement: asyncio.Task[list[dict[str, object]]] | None = None
     try:
+        await manager.load_all()
+        root = manager.live_root
+        old = manager.generation("feed")
+        assert root is not None and old is not None and old.fiber is not None
+        old_fiber = old.fiber
+        await manager.start_runtime()
+        owner_log = workspace / "plugin-data" / "feed-builtin" / "legacy-owner.jsonl"
+        servers = root.context.require(MCP_SERVERS)
+
+        async def hold_legacy_session() -> None:
+            async with servers.open(old_fiber.context, "feed") as server:
+                assert server.tool_names == ("legacy_status",)
+                opened.set()
+                await release.wait()
+
+        session = asyncio.create_task(hold_legacy_session())
+        await _eventually(opened.is_set)
+        await _eventually(owner_log.is_file)
         assert sum(len(timer.handles) for timer in timers) == 0
 
-        # 2. 准备并发布真实 Timer + Content 实现。
         _replace_with_current_feed(feed_dir)
         _prepare_python_environment(feed_dir, workspace)
-        candidate = await manager.prepare_candidate("feed")
-        assert candidate is not None
+        replacement = asyncio.create_task(manager.reconcile_changed())
+        await _eventually(lambda: old_fiber.state is FiberState.UNLOADING)
         assert sum(len(timer.handles) for timer in timers) == 0
-        result = await manager.publish_prepared("feed")
-        assert result["publication_state"] == "committed"
-        await _eventually(
-            lambda: sum(len(timer.handles) for timer in timers) == 1
-        )
+        release.set()
+        result = await replacement
+        assert any(row["publication_state"] == "active" for row in result)
+        await session
+        await _eventually(lambda: sum(len(timer.handles) for timer in timers) == 1)
         await _eventually(
             lambda: '"event": "stopped"' in owner_log.read_text(encoding="utf-8")
         )
 
-        # 3. 对比进程证据，而不只检查进程内对象状态。
         events = [
             json.loads(line)
             for line in owner_log.read_text(encoding="utf-8").splitlines()
@@ -390,7 +390,10 @@ async def test_legacy_mcp_owner_stops_before_new_timer_starts(
         assert len(scheduled) == 1
         assert events[1]["time_ns"] <= scheduled[0]
     finally:
-        lifecycle.cancel()
-        _ = await asyncio.gather(lifecycle, return_exceptions=True)
+        release.set()
+        if replacement is not None:
+            _ = await asyncio.gather(replacement, return_exceptions=True)
+        if session is not None:
+            _ = await asyncio.gather(session, return_exceptions=True)
         await manager.terminate_all()
         log.close()

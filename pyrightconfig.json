@@ -16,7 +16,7 @@
     {
       "root": ".",
       "pythonVersion": "3.13",
-      "extraPaths": ["mcp", ".akashic-core"]
+      "extraPaths": ["mcp", "mcp/scripts", ".cache/akashic-core"]
     }
   ]
 }
