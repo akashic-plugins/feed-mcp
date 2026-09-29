@@ -11,10 +11,9 @@ inject = (MCP_SERVERS,)
 skill_roots = ()
 
 
-async def apply(ctx: Context, config: object) -> None:
+async def apply(ctx: Context) -> None:
     """注册一个由 lifespan 拥有后台轮询的旧 MCP。"""
 
-    _ = config
     await ctx.require(MCP_SERVERS).register(
         ctx,
         McpServerDefinition(

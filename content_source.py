@@ -16,6 +16,8 @@ from .feed_runtime import CONTENT_SOURCE_ID, backend
 
 
 class BoundContentSource(Protocol):
+    def close(self) -> None: ...
+
     def submit(
         self, batch_id: str, items: Sequence[Mapping[str, object]]
     ) -> Mapping[str, object]: ...

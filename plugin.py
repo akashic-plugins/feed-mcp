@@ -28,16 +28,13 @@ api_version = 3
 name = "feed"
 version = "3.1.5"
 desc = "由 Timer 驱动的 Feed Content source 与用户 MCP"
-Config = FeedConfig
 inject = (TOOLS, MCP_SERVERS, TIMERS)
 skill_roots = ("skills",)
 
 
-async def apply(ctx: Context, config: object) -> None:
+async def apply(ctx: Context) -> None:
     """注册用户 MCP 工具和一个普通 Timer 驱动的 Content source。"""
-
-    if not isinstance(config, FeedConfig):
-        raise TypeError("feed config 必须是 FeedConfig")
+    _ = FeedConfig.model_validate(ctx.config)
 
     # 1. MCP 只拥有用户触发的订阅管理和缓存查询。
     await ctx.require(MCP_SERVERS).register(
@@ -55,16 +52,20 @@ async def apply(ctx: Context, config: object) -> None:
 
     # 2. EventMail 存在时，独立子 Fiber 才启动主动来源。
     async def apply_eventmail(source_ctx: Context) -> None:
+        content = source_ctx.require(CONTENT_SOURCE).bind(CONTENT_SOURCE_ID)
+        _ = await source_ctx.effect(
+            lambda: content.close,
+            label="feed-content-source-binding",
+        )
         runtime = FeedContentRuntime(
             source_ctx.data_root,
             source_ctx.require(TIMERS),
-            source_ctx.require(CONTENT_SOURCE).bind(CONTENT_SOURCE_ID),
+            content,
         )
-
-        def setup() -> object:
-            return runtime.close
-
-        _ = await source_ctx.effect(setup, label="feed-content-source-runtime")
+        _ = await source_ctx.effect(
+            lambda: runtime.close,
+            label="feed-content-source-runtime",
+        )
         _ = await source_ctx.on(RUNTIME_STARTED, lambda _: runtime.start())
         _ = await source_ctx.on(RUNTIME_STOPPING, lambda _: runtime.close())
 
