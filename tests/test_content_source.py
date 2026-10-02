@@ -63,15 +63,15 @@ class _Content:
             "duplicate": False,
         }
 
-    def submit(self, batch_id, items):
+    async def submit(self, batch_id, items):
         frozen = tuple(dict(item) for item in items)
         self.submissions.append((batch_id, frozen))
         return {"inserted": [item["item_id"] for item in frozen]}
 
-    def unsettled(self, limit=100):
+    async def unsettled(self, limit=100):
         return tuple(self.rows[:limit])
 
-    def ack(self, settlement_ref):
+    async def ack(self, settlement_ref):
         if self.fail_ack_once:
             self.fail_ack_once = False
             raise RuntimeError("crash after provider ACK")

@@ -18,13 +18,13 @@ from .feed_runtime import CONTENT_SOURCE_ID, backend
 class BoundContentSource(Protocol):
     def close(self) -> None: ...
 
-    def submit(
+    async def submit(
         self, batch_id: str, items: Sequence[Mapping[str, object]]
     ) -> Mapping[str, object]: ...
 
-    def unsettled(self, limit: int = 100) -> tuple[Mapping[str, object], ...]: ...
+    async def unsettled(self, limit: int = 100) -> tuple[Mapping[str, object], ...]: ...
 
-    def ack(self, settlement_ref: str) -> Mapping[str, object]: ...
+    async def ack(self, settlement_ref: str) -> Mapping[str, object]: ...
 
 
 class ContentSourceServices(Protocol):
@@ -119,7 +119,7 @@ class FeedContentRuntime:
             # 3. 非空 Content 提交成功后才能推进 source deadline。
             submitted = 0
             if items:
-                result = self._content.submit(_batch_id(items), items)
+                result = await self._content.submit(_batch_id(items), items)
                 inserted = result["inserted"]
                 if not isinstance(inserted, list):
                     raise TypeError("Feed Content submit receipt inserted 必须是 list")
@@ -158,7 +158,7 @@ class FeedContentRuntime:
         """用精确 Feed revision 收束每条已投递 Content receipt。"""
 
         settled = 0
-        while rows := self._content.unsettled(100):
+        while rows := await self._content.unsettled(100):
             for row in rows:
                 ref = _mapping(row["ref"], "Feed unsettled ref")
                 result = await asyncio.to_thread(
@@ -174,7 +174,7 @@ class FeedContentRuntime:
                 settlement_ref = _string(
                     row["settlement_ref"], "Feed settlement_ref"
                 )
-                receipt = self._content.ack(settlement_ref)
+                receipt = await self._content.ack(settlement_ref)
                 if receipt.get("settled") is not True:
                     raise RuntimeError(f"Feed Content ACK 未提交: {receipt!r}")
                 settled += 1

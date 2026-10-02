@@ -79,13 +79,13 @@ class _Content:
     def close(self) -> None:
         self.closed += 1
 
-    def submit(self, batch_id, items):
+    async def submit(self, batch_id, items):
         raise AssertionError((batch_id, items))
 
-    def unsettled(self, limit=100):
+    async def unsettled(self, limit=100):
         raise AssertionError(limit)
 
-    def ack(self, settlement_ref):
+    async def ack(self, settlement_ref):
         raise AssertionError(settlement_ref)
 
 
@@ -111,7 +111,7 @@ def test_pure_v3_exports_and_exact_apply() -> None:
     assert plugin.version == "3.1.5"
     assert plugin.skill_roots == ("skills",)
     assert tuple(inspect.signature(plugin.apply).parameters) == ("ctx",)
-    assert "eventmail.content_source.v1" in inspect.getsource(plugin)
+    assert "eventmail.content_source.v2" in inspect.getsource(plugin)
 
 
 @pytest.mark.asyncio

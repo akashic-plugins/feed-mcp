@@ -22,7 +22,7 @@ class FeedConfig(BaseModel):
     pass
 
 
-CONTENT_SOURCE = ServiceKey[ContentSourceServices]("eventmail.content_source.v1")
+CONTENT_SOURCE = ServiceKey[ContentSourceServices]("eventmail.content_source.v2")
 
 api_version = 3
 name = "feed"
