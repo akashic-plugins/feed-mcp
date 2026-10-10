@@ -9,8 +9,7 @@ from typing import cast
 
 import pytest
 
-from agent.control.timer import TimerReceipt, TimerStatus
-from agent.plugin_composition import PluginTimers
+from plugins.timer.contract import TimerReceipt, TimerStatus
 from feed_test_plugin.content_source import FeedContentRuntime  # pyright: ignore[reportMissingImports]
 from feed_test_plugin.feed_runtime import backend  # pyright: ignore[reportMissingImports]
 
@@ -116,7 +115,7 @@ async def test_timer_poll_submits_nonempty_once_and_empty_poll_has_no_history(
     _seed_item(tmp_path, now)
     runtime = FeedContentRuntime(
         tmp_path,
-        PluginTimers(timer),
+        timer,
         content,
         now=lambda: now,
     )
@@ -172,7 +171,7 @@ async def test_provider_ack_retries_after_crash_before_content_ack(
     content.fail_ack_once = True
     runtime = FeedContentRuntime(
         tmp_path,
-        PluginTimers(_Timer(now)),
+        _Timer(now),
         content,
         now=lambda: now,
     )
@@ -202,7 +201,7 @@ async def test_duplicate_content_ack_is_already_settled(tmp_path: Path) -> None:
     content.ack_receipt = {"settled": True, "duplicate": True}
     runtime = FeedContentRuntime(
         tmp_path,
-        PluginTimers(_Timer(now)),
+        _Timer(now),
         content,
         now=lambda: now,
     )
@@ -225,7 +224,7 @@ async def test_unsettled_content_ack_fails_loud(tmp_path: Path) -> None:
     content.ack_receipt = {"settled": False, "reason": "state_mismatch"}
     runtime = FeedContentRuntime(
         tmp_path,
-        PluginTimers(_Timer(now)),
+        _Timer(now),
         content,
         now=lambda: now,
     )

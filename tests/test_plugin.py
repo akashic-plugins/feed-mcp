@@ -11,17 +11,11 @@ from feed_test_plugin.tools import FEED_TOOLS
 import pytest
 
 from feed_test_plugin import plugin  # pyright: ignore[reportMissingImports]
-from agent.control.timer import AsyncioOneShotTimer
-from agent.plugin_composition import (
-    MCP_SERVERS,
-    TIMERS,
-    Context,
-    CompositionRoot,
-    Fiber,
-    PluginRuntime,
-    PluginTimers,
-)
-from agent.plugin_composition.mcp_slots import McpServerDefinition, McpServers
+from plugins.timer.timer import AsyncioOneShotTimer
+from agent.plugin_composition import Context, CompositionRoot, Fiber, PluginRuntime
+from plugins.mcp.contract import MCP_SERVERS
+from plugins.timer.contract import TIMERS
+from plugins.mcp.contract import McpServerDefinition, McpServers
 from agent.plugin_composition.tasks import TASKS, PluginTasks
 from agent.plugins.composable import ComposablePlugin
 from agent.plugins.static_manifest import load_static_plugin_manifest
@@ -108,7 +102,7 @@ async def _never_sleep(_seconds: float) -> None:
 def test_pure_v3_exports_and_exact_apply() -> None:
     assert plugin.api_version == 3
     assert plugin.name == "feed"
-    assert plugin.version == "3.1.5"
+    assert plugin.version == "3.1.6"
     assert plugin.skill_roots == ("skills",)
     assert tuple(inspect.signature(plugin.apply).parameters) == ("ctx",)
     assert "eventmail.content_source.v2" in inspect.getsource(plugin)
@@ -124,7 +118,7 @@ async def test_apply_registers_user_mcp_and_dormant_content_runtime(
     await root.context.provide(MCP_SERVERS, cast(McpServers, servers))
     await root.context.provide(
         TIMERS,
-        PluginTimers(AsyncioOneShotTimer(sleeper=_never_sleep)),
+        AsyncioOneShotTimer(),
     )
     await root.context.provide(plugin.CONTENT_SOURCE, sources)
     data_dir = tmp_path / "plugin-data"
@@ -171,7 +165,7 @@ async def test_apply_keeps_user_mcp_without_eventmail(tmp_path: Path) -> None:
     root = CompositionRoot("feed:without-eventmail")
     servers = _RecordingMcpServers()
     await root.context.provide(MCP_SERVERS, cast(McpServers, servers))
-    await root.context.provide(TIMERS, PluginTimers.candidate_validation())
+    await root.context.provide(TIMERS, AsyncioOneShotTimer())
     tasks, tools_fiber = await _mount_tools(root, tmp_path)
     try:
         composable = ComposablePlugin.from_module(
@@ -203,7 +197,7 @@ def test_static_manifest_reads_identity_and_runtime_requirements() -> None:
     manifest = load_static_plugin_manifest(ROOT)
 
     assert manifest.name == "feed"
-    assert manifest.version == plugin.version == "3.1.5"
+    assert manifest.version == plugin.version == "3.1.6"
     assert manifest.api_version == 3
     assert manifest.requirements == (
         "mcp/requirements.txt",

@@ -10,7 +10,7 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Protocol, cast
 
-from agent.plugin_composition import PluginTimers, TimerHandle, TimerStatus
+from plugins.timer.contract import OneShotTimer, TimerHandle, TimerStatus
 
 from .feed_runtime import CONTENT_SOURCE_ID, backend
 
@@ -37,7 +37,7 @@ class FeedContentRuntime:
     def __init__(
         self,
         data_root: Path,
-        timers: PluginTimers,
+        timers: OneShotTimer,
         content: BoundContentSource,
         *,
         now: Callable[[], datetime] | None = None,
