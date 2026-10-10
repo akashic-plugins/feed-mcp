@@ -5,15 +5,9 @@ from .tools import register_tools
 
 from pydantic import BaseModel
 
-from agent.plugin_composition import (
-    MCP_SERVERS,
-    RUNTIME_STARTED,
-    RUNTIME_STOPPING,
-    TIMERS,
-    Context,
-    McpServerDefinition,
-    ServiceKey,
-)
+from agent.plugin_composition import RUNTIME_STARTED, RUNTIME_STOPPING, Context, ServiceKey
+from plugins.mcp.contract import MCP_SERVERS, McpServerDefinition
+from plugins.timer.contract import TIMERS
 
 from .content_source import CONTENT_SOURCE_ID, ContentSourceServices, FeedContentRuntime
 
@@ -26,7 +20,7 @@ CONTENT_SOURCE = ServiceKey[ContentSourceServices]("eventmail.content_source.v2"
 
 api_version = 3
 name = "feed"
-version = "3.1.5"
+version = "3.1.6"
 desc = "由 Timer 驱动的 Feed Content source 与用户 MCP"
 inject = (TOOLS, MCP_SERVERS, TIMERS)
 skill_roots = ("skills",)

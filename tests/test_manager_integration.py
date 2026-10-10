@@ -11,18 +11,18 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
-import agent.plugins.host as plugin_host_module
-from agent.plugin_composition import FiberState, MCP_SERVERS
+from agent.plugins.importer import FreshSourceLoader
+from agent.plugin_composition import FiberState
+from plugins.mcp.contract import MCP_SERVERS
 from agent.plugin_composition.bindings import BINDINGS
 from agent.plugin_contracts.tools import ALL_TOOLS, TOOLS
 from agent.plugins.selection import PluginSelection
 from plugins.tools.plugin import open_tool
-from agent.control.timer import TimerReceipt, TimerStatus
+from plugins.timer.contract import TimerReceipt, TimerStatus
 from session.log import MessageLog
 from agent.plugins.manager import PluginManager
 from agent.plugins.python_environment import ENVIRONMENT_FILE, PythonEnvironments
 from agent.plugins.static_manifest import load_static_plugin_manifest
-from bus.event_bus import EventBus
 from plugins.eventmail.store import EventMailStore
 
 from feed_runtime import backend
@@ -79,6 +79,9 @@ class _Timer:
         handle = _TimerHandle(f"timer:{len(self.handles)}", deadline, self.now)
         self.handles.append(handle)
         return handle
+
+    async def close(self) -> None:
+        await asyncio.gather(*(handle.cleanup() for handle in self.handles))
 
 
 async def _eventually(predicate) -> None:
@@ -232,7 +235,16 @@ async def test_manager_real_mcp_and_timer_handoff(
         timers.append(timer)
         return timer
 
-    monkeypatch.setattr(plugin_host_module, "AsyncioOneShotTimer", timer_factory)
+    # Timer instances belong to fresh plugin generations, not the Core host.
+    load_module = FreshSourceLoader.exec_module
+
+    def load_timer(loader, module):
+        load_module(loader, module)
+        path = Path(module.__file__)
+        if path.name == "plugin.py" and path.parent.name == "timer":
+            module.AsyncioOneShotTimer = timer_factory
+
+    monkeypatch.setattr(FreshSourceLoader, "exec_module", load_timer)
     content_dir, feed_dir = _stage_plugins(tmp_path)
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -245,10 +257,9 @@ async def test_manager_real_mcp_and_timer_handoff(
             content_dir,
             feed_dir,
             *(CORE_ROOT / "plugins" / name for name in (
-                "content", "tools", "mcp", "managed_processes",
+                "content", "tools", "mcp", "managed_processes", "timer",
             )),
         ],
-        event_bus=EventBus(),
         workspace=workspace,
         installed_cache_root=tmp_path / "cache",
     )
@@ -322,7 +333,16 @@ async def test_legacy_mcp_owner_drains_before_new_timer_starts(
         timers.append(timer)
         return timer
 
-    monkeypatch.setattr(plugin_host_module, "AsyncioOneShotTimer", timer_factory)
+    # Timer instances belong to fresh plugin generations, not the Core host.
+    load_module = FreshSourceLoader.exec_module
+
+    def load_timer(loader, module):
+        load_module(loader, module)
+        path = Path(module.__file__)
+        if path.name == "plugin.py" and path.parent.name == "timer":
+            module.AsyncioOneShotTimer = timer_factory
+
+    monkeypatch.setattr(FreshSourceLoader, "exec_module", load_timer)
     content_dir, feed_dir = _stage_legacy_plugins(tmp_path)
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -335,10 +355,9 @@ async def test_legacy_mcp_owner_drains_before_new_timer_starts(
             content_dir,
             feed_dir,
             *(CORE_ROOT / "plugins" / name for name in (
-                "content", "tools", "mcp", "managed_processes",
+                "content", "tools", "mcp", "managed_processes", "timer",
             )),
         ],
-        event_bus=EventBus(),
         workspace=workspace,
         installed_cache_root=tmp_path / "cache",
     )

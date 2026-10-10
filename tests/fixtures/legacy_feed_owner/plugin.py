@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from agent.plugin_composition import MCP_SERVERS, Context, McpServerDefinition
+from agent.plugin_composition import Context
+from plugins.mcp.contract import MCP_SERVERS, McpServerDefinition
 
 
 api_version = 3
