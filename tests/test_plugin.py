@@ -19,7 +19,7 @@ from plugins.mcp.contract import McpServerDefinition, McpServers
 from agent.plugin_composition.tasks import TASKS, PluginTasks
 from agent.plugins.composable import ComposablePlugin
 from agent.plugins.static_manifest import load_static_plugin_manifest
-from feed_test_plugin.content_source import (  # pyright: ignore[reportMissingImports]
+from plugins.eventmail.contract import (
     BoundContentSource,
     ContentSourceServices,
 )
@@ -105,7 +105,6 @@ def test_pure_v3_exports_and_exact_apply() -> None:
     assert plugin.version == "3.1.6"
     assert plugin.skill_roots == ("skills",)
     assert tuple(inspect.signature(plugin.apply).parameters) == ("ctx",)
-    assert "eventmail.content_source.v2" in inspect.getsource(plugin)
 
 
 @pytest.mark.asyncio
@@ -120,7 +119,7 @@ async def test_apply_registers_user_mcp_and_dormant_content_runtime(
         TIMERS,
         AsyncioOneShotTimer(),
     )
-    await root.context.provide(plugin.CONTENT_SOURCE, sources)
+    await root.context.provide(plugin.EVENTMAIL_CONTENT_SOURCE, sources)
     data_dir = tmp_path / "plugin-data"
     tasks, tools_fiber = await _mount_tools(root, tmp_path)
     try:

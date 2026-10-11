@@ -8,27 +8,14 @@ from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Protocol, cast
+from typing import cast
 
 from plugins.timer.contract import OneShotTimer, TimerHandle, TimerStatus
 
 from .feed_runtime import CONTENT_SOURCE_ID, backend
 
 
-class BoundContentSource(Protocol):
-    def close(self) -> None: ...
-
-    async def submit(
-        self, batch_id: str, items: Sequence[Mapping[str, object]]
-    ) -> Mapping[str, object]: ...
-
-    async def unsettled(self, limit: int = 100) -> tuple[Mapping[str, object], ...]: ...
-
-    async def ack(self, settlement_ref: str) -> Mapping[str, object]: ...
-
-
-class ContentSourceServices(Protocol):
-    def bind(self, source_id: str) -> BoundContentSource: ...
+from plugins.eventmail.contract import BoundContentSource
 
 
 class FeedContentRuntime:
