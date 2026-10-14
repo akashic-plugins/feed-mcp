@@ -21,6 +21,7 @@ import time
 import uuid
 import xml.etree.ElementTree as ET
 import os
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from email.utils import parsedate_to_datetime
@@ -1310,6 +1311,7 @@ def _build_display_text(row: sqlite3.Row) -> str:
 
 
 _TOKEN_RE = re.compile(r"[a-z0-9_+#.-]{2,}|[\u4e00-\u9fff]", re.IGNORECASE)
+_CJK_CHAR_RE = re.compile(r"[\u4e00-\u9fff]")
 _RANK_BIAS = -0.8
 _FRESHNESS_HALF_LIFE_HOURS = 36.0
 _EXPOSURE_RECENCY_HALF_LIFE_HOURS = 12.0
@@ -1326,7 +1328,7 @@ def _tokenize_rank_text(*parts: object) -> list[str]:
     tokens: list[str] = []
     cjk_buffer: list[str] = []
     for token in raw_tokens:
-        if re.fullmatch(r"[\u4e00-\u9fff]", token):
+        if _CJK_CHAR_RE.fullmatch(token):
             cjk_buffer.append(token)
             continue
         if len(cjk_buffer) >= 2:
@@ -1348,12 +1350,14 @@ def _tokenize_rank_text(*parts: object) -> list[str]:
     return result
 
 
-def _rank_stat_keys(row: sqlite3.Row) -> list[str]:
+def _rank_stat_keys(row: sqlite3.Row, tokens: list[str] | None = None) -> list[str]:
     keys = [f"source:{row['source_id']}"]
     author = str(row["author"] or "").strip().lower()
     if author:
         keys.append(f"author:{author[:96]}")
-    for token in _tokenize_rank_text(row["source_name"], row["title"], row["content"]):
+    if tokens is None:
+        tokens = _row_rank_token_list(row)
+    for token in tokens:
         keys.append(f"token:{token}")
     return keys
 
@@ -1401,6 +1405,10 @@ def _update_rank_stats_for_row(
         )
 
 
+# Rank lookups bind every key as one SQL variable; stay below SQLite's oldest default limit.
+_RANK_LOOKUP_CHUNK = 900
+
+
 def _rank_stats(conn: sqlite3.Connection, keys: list[str]) -> dict[str, tuple[int, int]]:
     if not keys:
         return {}
@@ -1421,6 +1429,19 @@ def _rank_model_weights(conn: sqlite3.Connection, keys: list[str]) -> dict[str, 
         keys,
     ).fetchall()
     return {str(row["key"]): float(row["weight"]) for row in rows}
+
+
+# Load one ranking pass worth of stats or weights in a few chunked queries.
+def _chunked_rank_lookup[T](
+    conn: sqlite3.Connection,
+    keys: set[str],
+    lookup: Callable[[sqlite3.Connection, list[str]], dict[str, T]],
+) -> dict[str, T]:
+    ordered = sorted(keys)
+    loaded: dict[str, T] = {}
+    for start in range(0, len(ordered), _RANK_LOOKUP_CHUNK):
+        loaded.update(lookup(conn, ordered[start:start + _RANK_LOOKUP_CHUNK]))
+    return loaded
 
 
 def _update_rank_model_weights(
@@ -1555,17 +1576,46 @@ def _jaccard(left: set[str], right: set[str]) -> float:
     return len(left & right) / len(left | right)
 
 
-def _frontier_overlap(left: set[str], right: set[str]) -> float:
-    if not left or not right:
-        return 0.0
-    intersection = len(left & right)
-    return max(intersection / len(left | right), intersection / min(len(left), len(right)))
+# Recent context token sets encoded once per ranking pass as (bitmask, size) pairs.
+@dataclass(frozen=True, slots=True)
+class _ContextMasks:
+    bit_by_token: dict[str, int]
+    masks: tuple[tuple[int, int], ...]
 
 
-def _novelty_score(tokens: set[str], contexts: list[set[str]]) -> float:
+def _encode_contexts(contexts: list[set[str]]) -> _ContextMasks:
+    bit_by_token: dict[str, int] = {}
+    masks: list[tuple[int, int]] = []
+    for context in contexts:
+        mask = 0
+        for token in context:
+            mask |= 1 << bit_by_token.setdefault(token, len(bit_by_token))
+        if context:
+            masks.append((mask, len(context)))
+    return _ContextMasks(bit_by_token, tuple(masks))
+
+
+def _novelty_score(
+    tokens: set[str],
+    contexts: list[set[str]],
+    context_masks: _ContextMasks | None = None,
+) -> float:
     if not tokens or not contexts:
         return 1.0
-    max_overlap = max((_jaccard(tokens, ctx) for ctx in contexts), default=0.0)
+    if context_masks is None:
+        max_overlap = max((_jaccard(tokens, ctx) for ctx in contexts), default=0.0)
+        return max(0.05, 1.0 - max_overlap)
+    # Same Jaccard as _jaccard: |a & b| / (|a| + |b| - |a & b|); empty contexts score 0.
+    mask = 0
+    for token in tokens:
+        bit = context_masks.bit_by_token.get(token)
+        if bit is not None:
+            mask |= 1 << bit
+    size = len(tokens)
+    max_overlap = 0.0
+    for context_mask, context_size in context_masks.masks:
+        intersection = (mask & context_mask).bit_count()
+        max_overlap = max(max_overlap, intersection / (size + context_size - intersection))
     return max(0.05, 1.0 - max_overlap)
 
 
@@ -1601,33 +1651,83 @@ def _impression_summary(
     }
 
 
+def _row_rank_token_list(row: sqlite3.Row) -> list[str]:
+    return _tokenize_rank_text(row["source_name"], row["title"], row["content"])
+
+
 def _row_rank_tokens(row: sqlite3.Row) -> set[str]:
-    return set(_tokenize_rank_text(row["source_name"], row["title"], row["content"]))
+    return set(_row_rank_token_list(row))
 
 
 def _row_rank_time(row: sqlite3.Row, now: datetime) -> datetime:
     return _parse_rank_dt(row["published_at"]) or _parse_rank_dt(row["first_seen_at"]) or now
 
 
-def _frontier_scores(rows: list[sqlite3.Row], now: datetime) -> dict[str, float]:
-    tokens_by_id = {str(row["event_id"]): _row_rank_tokens(row) for row in rows}
-    time_by_id = {str(row["event_id"]): _row_rank_time(row, now) for row in rows}
-    scores: dict[str, float] = {}
+# Penalize rows whose tokens a strictly newer row of the same source already covers.
+def _frontier_scores(
+    rows: list[sqlite3.Row],
+    now: datetime,
+    tokens_by_id: dict[str, set[str]] | None = None,
+) -> dict[str, float]:
+    # 1. Only same-source rows can affect each other, so compare inside each source.
+    groups: dict[object, list[tuple[datetime, set[str], str]]] = {}
     for row in rows:
         event_id = str(row["event_id"])
-        tokens = tokens_by_id[event_id]
-        max_newer_overlap = 0.0
-        for other in rows:
-            other_id = str(other["event_id"])
-            if other_id == event_id:
-                continue
-            if other["source_id"] != row["source_id"]:
-                continue
-            if time_by_id[other_id] <= time_by_id[event_id]:
-                continue
-            max_newer_overlap = max(max_newer_overlap, _frontier_overlap(tokens, tokens_by_id[other_id]))
-        scores[event_id] = 1.0 if max_newer_overlap < 0.13 else max(0.08, 1.0 - 3.0 * max_newer_overlap)
+        tokens = tokens_by_id[event_id] if tokens_by_id is not None else _row_rank_tokens(row)
+        groups.setdefault(row["source_id"], []).append(
+            (_row_rank_time(row, now), tokens, event_id)
+        )
+    # 2. Score each source independently; results do not depend on group order.
+    scores: dict[str, float] = {}
+    for members in groups.values():
+        scores.update(_source_frontier_scores(members))
     return scores
+
+
+# Walk one source newest-first and compare each row only with strictly newer rows.
+def _source_frontier_scores(members: list[tuple[datetime, set[str], str]]) -> dict[str, float]:
+    # 1. Encode token sets as bitmasks so intersections run in C.
+    bit_by_token: dict[str, int] = {}
+    encoded: list[tuple[datetime, int, int, str]] = []
+    for ts, tokens, event_id in members:
+        mask = 0
+        for token in tokens:
+            mask |= 1 << bit_by_token.setdefault(token, len(bit_by_token))
+        encoded.append((ts, mask, len(tokens), event_id))
+    encoded.sort(key=lambda item: item[0], reverse=True)
+    # 2. Rows sharing one timestamp are not newer than each other; publish them per block.
+    scores: dict[str, float] = {}
+    newer: list[tuple[int, int]] = []
+    start = 0
+    while start < len(encoded):
+        end = start
+        while end < len(encoded) and encoded[end][0] == encoded[start][0]:
+            end += 1
+        block = encoded[start:end]
+        for _ts, mask, size, event_id in block:
+            scores[event_id] = _frontier_score_from_overlap(_max_newer_overlap(mask, size, newer))
+        newer.extend((mask, size) for _ts, mask, size, _event_id in block if size)
+        start = end
+    return scores
+
+
+# Overlap is max(jaccard, containment); containment always dominates because union >= min.
+def _max_newer_overlap(mask: int, size: int, newer: list[tuple[int, int]]) -> float:
+    best = 0.0
+    if not size:
+        return best
+    for other_mask, other_size in newer:
+        overlap = (mask & other_mask).bit_count() / min(size, other_size)
+        if overlap > best:
+            best = overlap
+            # Past this point the score is pinned at its 0.08 floor.
+            if 1.0 - 3.0 * best <= 0.08:
+                break
+    return best
+
+
+def _frontier_score_from_overlap(max_newer_overlap: float) -> float:
+    return 1.0 if max_newer_overlap < 0.13 else max(0.08, 1.0 - 3.0 * max_newer_overlap)
 
 
 def _rank_candidate(
@@ -1639,11 +1739,19 @@ def _rank_candidate(
     frontier: float,
     exposure_count: int,
     last_exposed_at: str | None,
+    *,
+    token_list: list[str] | None = None,
+    preloaded_stats: dict[str, tuple[int, int]] | None = None,
+    context_masks: _ContextMasks | None = None,
 ) -> tuple[float, dict[str, float]]:
-    tokens = _row_rank_tokens(row)
+    if token_list is None:
+        token_list = _row_rank_token_list(row)
+    tokens = set(token_list)
     information_density = min(1.0, len(tokens) / 16.0)
-    keys = _rank_stat_keys(row)
-    stats = _rank_stats(conn, keys)
+    if preloaded_stats is None:
+        stats = _rank_stats(conn, _rank_stat_keys(row, token_list))
+    else:
+        stats = preloaded_stats
     source_pos, source_neg = stats.get(f"source:{row['source_id']}", (0, 0))
     author = str(row["author"] or "").strip().lower()
     author_pos, author_neg = stats.get(f"author:{author[:96]}", (0, 0)) if author else (0, 0)
@@ -1656,7 +1764,7 @@ def _rank_candidate(
     source_prior = _accept_rate(source_pos, source_neg)
     author_prior = _accept_rate(author_pos, author_neg) if author else 0.5
     freshness, age_hours = _freshness_score(row, cfg, now)
-    novelty = _novelty_score(tokens, contexts)
+    novelty = _novelty_score(tokens, contexts, context_masks)
     exposure_decay = _exposure_decay(exposure_count, last_exposed_at, now)
     z = (
         _RANK_BIAS
@@ -1705,8 +1813,10 @@ def _age_bucket(age_hours: float) -> str:
 def _model_feature_values(
     row: sqlite3.Row,
     coarse_features: dict[str, float],
+    tokens: list[str] | None = None,
 ) -> dict[str, float]:
-    tokens = _tokenize_rank_text(row["source_name"], row["title"], row["content"])
+    if tokens is None:
+        tokens = _row_rank_token_list(row)
     token_weight = 1.0 / math.sqrt(max(1, min(len(tokens), 32)))
     features: dict[str, float] = {
         "bias": 1.0,
@@ -1730,8 +1840,12 @@ def _model_feature_values(
 def _predict_rank_model(
     conn: sqlite3.Connection,
     features: dict[str, float],
+    preloaded_weights: dict[str, float] | None = None,
 ) -> float:
-    weights = _rank_model_weights(conn, list(features))
+    if preloaded_weights is None:
+        weights = _rank_model_weights(conn, list(features))
+    else:
+        weights = preloaded_weights
     return _sigmoid(sum(weights.get(key, 0.0) * value for key, value in features.items()))
 
 
@@ -1786,31 +1900,61 @@ def _information_gain_score(ml_score: float, features: dict[str, float]) -> floa
     )
 
 
+# Rank rows by coarse score, model refinement and per-source diversity.
 def _rank_rows(
     conn: sqlite3.Connection,
     cfg: FeedMcpConfig,
     rows: list[sqlite3.Row],
     now: datetime,
 ) -> list[tuple[sqlite3.Row, float, dict[str, float]]]:
+    # 1. Tokenize every row once; all ranking stages reuse the same token list.
+    tokens_by_id = {str(row["event_id"]): _row_rank_token_list(row) for row in rows}
+    coarse_ranked = _coarse_rank_rows(conn, cfg, rows, now, tokens_by_id)
+    # 2. Refine with the online model, then apply the source diversity decay.
+    refined = _refine_rank_rows(conn, coarse_ranked, tokens_by_id)
+    return _diversify_rank_rows(refined)
+
+
+# Score every row with stats, freshness, novelty, exposure and frontier features.
+def _coarse_rank_rows(
+    conn: sqlite3.Connection,
+    cfg: FeedMcpConfig,
+    rows: list[sqlite3.Row],
+    now: datetime,
+    tokens_by_id: dict[str, list[str]],
+) -> list[tuple[sqlite3.Row, float, dict[str, float]]]:
+    # 1. Load pass-wide inputs once instead of querying per row.
     contexts = _recent_context_tokens(conn, now)
-    frontier_by_id = _frontier_scores(rows, now)
+    context_masks = _encode_contexts(contexts)
+    frontier_by_id = _frontier_scores(
+        rows, now, {event_id: set(tokens) for event_id, tokens in tokens_by_id.items()}
+    )
     impressions_by_id = _impression_summary(conn, [str(row["event_id"]) for row in rows])
-    coarse_ranked = [
-        (
-            row,
-            *_rank_candidate(
-                conn,
-                cfg,
-                row,
-                contexts,
-                now,
-                frontier_by_id.get(str(row["event_id"]), 1.0),
-                impressions_by_id.get(str(row["event_id"]), (0, None))[0],
-                impressions_by_id.get(str(row["event_id"]), (0, None))[1],
-            ),
-        )
+    stat_keys = {
+        key
         for row in rows
-    ]
+        for key in _rank_stat_keys(row, tokens_by_id[str(row["event_id"])])
+    }
+    stats = _chunked_rank_lookup(conn, stat_keys, _rank_stats)
+    # 2. Score each row with the shared inputs.
+    coarse_ranked: list[tuple[sqlite3.Row, float, dict[str, float]]] = []
+    for row in rows:
+        event_id = str(row["event_id"])
+        exposure_count, last_exposed_at = impressions_by_id.get(event_id, (0, None))
+        score, features = _rank_candidate(
+            conn,
+            cfg,
+            row,
+            contexts,
+            now,
+            frontier_by_id.get(event_id, 1.0),
+            exposure_count,
+            last_exposed_at,
+            token_list=tokens_by_id[event_id],
+            preloaded_stats=stats,
+            context_masks=context_masks,
+        )
+        coarse_ranked.append((row, score, features))
     coarse_ranked.sort(
         key=lambda item: (
             item[1],
@@ -1818,10 +1962,28 @@ def _rank_rows(
         ),
         reverse=True,
     )
+    return coarse_ranked
+
+
+# Blend the online model prediction into an information-gain score.
+def _refine_rank_rows(
+    conn: sqlite3.Connection,
+    coarse_ranked: list[tuple[sqlite3.Row, float, dict[str, float]]],
+    tokens_by_id: dict[str, list[str]],
+) -> list[tuple[sqlite3.Row, float, dict[str, float]]]:
+    # 1. Build model features first so all weights load in a few queries.
+    ml_features_by_row = [
+        _model_feature_values(row, features, tokens_by_id[str(row["event_id"])])
+        for row, _coarse_score, features in coarse_ranked
+    ]
+    weight_keys = {key for ml_features in ml_features_by_row for key in ml_features}
+    weights = _chunked_rank_lookup(conn, weight_keys, _rank_model_weights)
+    # 2. Predict and merge features in coarse order.
     refined: list[tuple[sqlite3.Row, float, dict[str, float]]] = []
-    for row, coarse_score, features in coarse_ranked:
-        ml_features = _model_feature_values(row, features)
-        ml_score = _predict_rank_model(conn, ml_features)
+    for (row, coarse_score, features), ml_features in zip(
+        coarse_ranked, ml_features_by_row, strict=True
+    ):
+        ml_score = _predict_rank_model(conn, ml_features, weights)
         merged = dict(features)
         merged["coarse_score"] = coarse_score
         merged["ml_score"] = ml_score
@@ -1837,6 +1999,13 @@ def _rank_rows(
         ),
         reverse=True,
     )
+    return refined
+
+
+# Decay repeated sources geometrically down the refined order.
+def _diversify_rank_rows(
+    refined: list[tuple[sqlite3.Row, float, dict[str, float]]],
+) -> list[tuple[sqlite3.Row, float, dict[str, float]]]:
     source_counts: dict[str, int] = {}
     adjusted: list[tuple[sqlite3.Row, float, dict[str, float]]] = []
     for row, score, features in refined:
