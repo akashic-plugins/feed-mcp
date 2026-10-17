@@ -232,17 +232,34 @@ async def _prepare_content_items(
     )
     try:
         stdout, stderr = await process.communicate()
-    finally:
-        # 2. 取消时先结束并回收子进程，下一轮不会与残留进程同时写 Feed 数据库。
-        if process.returncode is None:
-            process.kill()
-            _ = await process.wait()
+    except BaseException:
+        # 2. 取消或读取失败时先回收子进程，下一轮不会与残留进程同时写 Feed 数据库。
+        await _reap_process(process)
+        raise
     if process.returncode != 0:
         detail = stderr.decode("utf-8", "replace").strip()[-2000:]
         raise RuntimeError(
             f"Feed Content 准备进程失败（退出码 {process.returncode}）：{detail}"
         )
     return _prepared_items(json.loads(stdout))
+
+
+# 被取消的 communicate 已带走管道读取者；kill 后必须继续排空管道，wait 才能返回。
+async def _reap_process(process: asyncio.subprocess.Process) -> None:
+    # 1. 结束子进程；已退出时只需排空。
+    if process.returncode is None:
+        process.kill()
+
+    # 2. 由一个受 shield 保护的 communicate 排空 stdout/stderr 并等进程退出。
+    drain = asyncio.ensure_future(process.communicate())
+
+    # 3. 清理期间再次取消也继续等待，直到排空任务真正结束。
+    while not drain.done():
+        try:
+            _ = await asyncio.shield(drain)
+        except asyncio.CancelledError:
+            continue
+    _ = drain.result()
 
 
 def _prepared_items(value: object) -> tuple[dict[str, object], ...]:
