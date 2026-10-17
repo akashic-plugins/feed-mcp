@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import sys
 from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from logging.handlers import RotatingFileHandler
@@ -112,8 +113,8 @@ class FeedContentRuntime:
             await asyncio.to_thread(
                 backend.poll_feeds_only, data_root=self._data_root
             )
-            items = await asyncio.to_thread(
-                backend.prepare_content_items, data_root=self._data_root
+            items = await _prepare_content_items(
+                self._data_root, self._aware_now()
             )
 
             # 3. 非空 Content 提交成功后才能推进 source deadline。
@@ -211,6 +212,46 @@ class FeedContentRuntime:
         self._log.removeHandler(handler)
         handler.close()
         self._log_handler = None
+
+
+# 排序是长时间纯 CPU 计算，放进独立进程，宿主事件循环不再与它争 GIL。
+async def _prepare_content_items(
+    data_root: Path, now: datetime
+) -> tuple[dict[str, object], ...]:
+    # 1. 子进程按文件路径执行部署版本 backend，-I 不读取宿主的 PYTHON* 环境。
+    process = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-I",
+        str(Path(backend.__file__)),
+        "prepare-content-items",
+        str(data_root),
+        now.isoformat(),
+        stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        stdout, stderr = await process.communicate()
+    finally:
+        # 2. 取消时先结束并回收子进程，下一轮不会与残留进程同时写 Feed 数据库。
+        if process.returncode is None:
+            process.kill()
+            _ = await process.wait()
+    if process.returncode != 0:
+        detail = stderr.decode("utf-8", "replace").strip()[-2000:]
+        raise RuntimeError(
+            f"Feed Content 准备进程失败（退出码 {process.returncode}）：{detail}"
+        )
+    return _prepared_items(json.loads(stdout))
+
+
+def _prepared_items(value: object) -> tuple[dict[str, object], ...]:
+    if not isinstance(value, list):
+        raise TypeError("Feed Content 准备结果必须是 list")
+    return tuple(
+        dict(_mapping(item, "Feed Content item"))
+        for item in cast(list[object], value)
+    )
 
 
 def _batch_id(items: Sequence[Mapping[str, object]]) -> str:

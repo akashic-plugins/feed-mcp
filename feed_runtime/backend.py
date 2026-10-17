@@ -17,6 +17,7 @@ import math
 import re
 import sqlite3
 import subprocess
+import sys
 import time
 import uuid
 import xml.etree.ElementTree as ET
@@ -2074,14 +2075,17 @@ def poll_feeds_only(*, data_root: Path | None = None) -> None:
         conn.close()
 
 
-def prepare_content_items(*, data_root: Path) -> tuple[dict[str, object], ...]:
+def prepare_content_items(
+    *, data_root: Path, now: datetime | None = None
+) -> tuple[dict[str, object], ...]:
     """Freeze complete current revisions for idempotent Content submission."""
 
     cfg = load_config(data_root)
     conn = _connect(cfg)
     try:
         # 1. Rank every current unacknowledged item.
-        now = _now()
+        if now is None:
+            now = _now()
         rows = conn.execute(
             """
             SELECT
@@ -2695,3 +2699,22 @@ def commit_content_source_deadline(*, data_root: Path, deadline: datetime) -> No
         conn.commit()
     finally:
         conn.close()
+
+
+# 独立进程入口：排序与冻结在子解释器里完成，结果以 JSON 写到 stdout。
+def _run_prepare_content_items(argv: list[str]) -> int:
+    if len(argv) != 3 or argv[0] != "prepare-content-items":
+        print(
+            "usage: backend.py prepare-content-items <data_root> <now>",
+            file=sys.stderr,
+        )
+        return 2
+    items = prepare_content_items(
+        data_root=Path(argv[1]), now=datetime.fromisoformat(argv[2])
+    )
+    sys.stdout.write(json.dumps(items, separators=(",", ":")))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(_run_prepare_content_items(sys.argv[1:]))
