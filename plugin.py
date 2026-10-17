@@ -1,22 +1,22 @@
 from __future__ import annotations
 
-from ._tool_contract import TOOLS
+from plugins.tools.contract import TOOLS
 from .tools import register_tools
 
 from pydantic import BaseModel
 
-from agent.plugin_composition import RUNTIME_STARTED, RUNTIME_STOPPING, Context, ServiceKey
+from agent.plugin_composition import RUNTIME_STARTED, RUNTIME_STOPPING, Context
 from plugins.mcp.contract import MCP_SERVERS, McpServerDefinition
 from plugins.timer.contract import TIMERS
 
-from .content_source import CONTENT_SOURCE_ID, ContentSourceServices, FeedContentRuntime
+from .content_source import CONTENT_SOURCE_ID, FeedContentRuntime
 
 
 class FeedConfig(BaseModel):
     pass
 
 
-CONTENT_SOURCE = ServiceKey[ContentSourceServices]("eventmail.content_source.v2")
+from plugins.eventmail.contract import EVENTMAIL_CONTENT_SOURCE
 
 api_version = 3
 name = "feed"
@@ -46,7 +46,7 @@ async def apply(ctx: Context) -> None:
 
     # 2. EventMail 存在时，独立子 Fiber 才启动主动来源。
     async def apply_eventmail(source_ctx: Context) -> None:
-        content = source_ctx.require(CONTENT_SOURCE).bind(CONTENT_SOURCE_ID)
+        content = source_ctx.require(EVENTMAIL_CONTENT_SOURCE).bind(CONTENT_SOURCE_ID)
         _ = await source_ctx.effect(
             lambda: content.close,
             label="feed-content-source-binding",
@@ -64,7 +64,7 @@ async def apply(ctx: Context) -> None:
         _ = await source_ctx.on(RUNTIME_STOPPING, lambda _: runtime.close())
 
     _ = await ctx.inject(
-        (TIMERS, CONTENT_SOURCE),
+        (TIMERS, EVENTMAIL_CONTENT_SOURCE),
         apply_eventmail,
         name="feed-eventmail-source",
     )

@@ -14,12 +14,12 @@ import pytest
 from agent.plugins.importer import FreshSourceLoader
 from agent.plugin_composition import FiberState
 from plugins.mcp.contract import MCP_SERVERS
-from agent.plugin_composition.bindings import BINDINGS
-from agent.plugin_contracts.tools import ALL_TOOLS, TOOLS
+from plugins.ledger.contract import BINDINGS
+from plugins.tools.contract import ALL_TOOLS, TOOLS
 from agent.plugins.selection import PluginSelection
 from plugins.tools.plugin import open_tool
 from plugins.timer.contract import TimerReceipt, TimerStatus
-from session.log import MessageLog
+from plugins.ledger.log import MessageLog
 from agent.plugins.manager import PluginManager
 from agent.plugins.python_environment import ENVIRONMENT_FILE, PythonEnvironments
 from agent.plugins.static_manifest import load_static_plugin_manifest
@@ -250,19 +250,8 @@ async def test_manager_real_mcp_and_timer_handoff(
     workspace.mkdir()
     PluginSelection(workspace).initialize()
     _prepare_python_environment(feed_dir, workspace)
-    log = MessageLog(tmp_path / "sessions.db")
-    manager = PluginManager(
-        message_log=log,
-        plugin_dirs=[
-            content_dir,
-            feed_dir,
-            *(CORE_ROOT / "plugins" / name for name in (
-                "content", "tools", "mcp", "managed_processes", "timer",
-            )),
-        ],
-        workspace=workspace,
-        installed_cache_root=tmp_path / "cache",
-    )
+    log = MessageLog(workspace / "sessions.db")
+    manager = PluginManager(plugin_dirs=[content_dir, feed_dir, *(CORE_ROOT / 'plugins' / name for name in ('ledger', 'host_execution', 'content', 'tools', 'mcp', 'managed_processes', 'timer'))], workspace=workspace, installed_cache_root=tmp_path / 'cache')
     try:
         await manager.load_all()
         root = manager.live_root
@@ -276,7 +265,7 @@ async def test_manager_real_mcp_and_timer_handoff(
         target = next(ref for ref in refs if ref.name == "mcp_feed__feed_query")
         bindings = root.context.require(BINDINGS)
         identity = await root.context.require(TOOLS).bind(target, bindings)
-        async with open_tool(bindings, identity) as tool:
+        async with old.fiber.context.runtime_scope(), open_tool(bindings, identity) as tool:
             call = await tool.invoke("catalog", {"action": "catalog"})
             assert call.outcome == "success"
             assert "没有匹配的启用订阅" in str(call.parts)
@@ -348,19 +337,8 @@ async def test_legacy_mcp_owner_drains_before_new_timer_starts(
     workspace.mkdir()
     PluginSelection(workspace).initialize()
     _prepare_python_environment(feed_dir, workspace)
-    log = MessageLog(tmp_path / "sessions.db")
-    manager = PluginManager(
-        message_log=log,
-        plugin_dirs=[
-            content_dir,
-            feed_dir,
-            *(CORE_ROOT / "plugins" / name for name in (
-                "content", "tools", "mcp", "managed_processes", "timer",
-            )),
-        ],
-        workspace=workspace,
-        installed_cache_root=tmp_path / "cache",
-    )
+    log = MessageLog(workspace / "sessions.db")
+    manager = PluginManager(plugin_dirs=[content_dir, feed_dir, *(CORE_ROOT / 'plugins' / name for name in ('ledger', 'host_execution', 'content', 'tools', 'mcp', 'managed_processes', 'timer'))], workspace=workspace, installed_cache_root=tmp_path / 'cache')
     release = asyncio.Event()
     opened = asyncio.Event()
     session: asyncio.Task[None] | None = None
