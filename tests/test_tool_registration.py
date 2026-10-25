@@ -1,26 +1,16 @@
 from __future__ import annotations
 
-import json
-from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from plugins.mcp.contract import MCP_SERVERS
-from plugins.mcp.contract import McpCallResult
 from plugins.tools.plugin import TOOLS, ToolRef, ToolView
-from feed_test_plugin.tools import register_tools
-
-
-ROOT = Path(__file__).resolve().parents[1]
+from feed_test_plugin.tools import FEED_TOOLS, register_tools
 
 
 @pytest.mark.asyncio
-async def test_discovery_is_lazy_and_calls_keep_route_errors():
-    records = json.loads((ROOT / "tool_catalog.json").read_text())
+async def test_native_tools_validate_and_use_plugin_data_root(tmp_path: Path):
     registrations = {}
-    calls = []
-    opened = []
 
     class Catalog:
         async def declare_group(self, ctx, **kwargs):
@@ -33,61 +23,28 @@ async def test_discovery_is_lazy_and_calls_keep_route_errors():
             registrations[record["name"]] = record
             return ToolRef(record["name"], record)
 
-    class Route:
-        async def call(self, name, arguments):
-            calls.append((name, arguments))
-            if arguments.get("fail_transport"):
-                raise ConnectionError("MCP disconnected")
-            return McpCallResult("tool_error" if arguments.get("fail_tool") else "success", "remote result")
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *_):
-            opened.append("route closed")
-
-    server = SimpleNamespace(
-        tools={item["name"]: SimpleNamespace(input_schema=item["parameters"]) for item in records},
-        route=Route,
-    )
-
-    class Servers:
-        @asynccontextmanager
-        async def open(self, ctx, name):
-            opened.append(name)
-            yield server
-
-    services = {TOOLS: Catalog(), MCP_SERVERS: Servers()}
+    services = {TOOLS: Catalog()}
     async def provide(key, value):
         services[key] = value
-    ctx = SimpleNamespace(require=services.__getitem__, provide=provide)
-    await register_tools(ctx, description="fixture MCP tools")
-    assert not opened
-    assert not calls
-    assert len(registrations) == len(records)
-    assert all("risk" not in record and "search_hint" not in record for record in registrations.values())
+    ctx = SimpleNamespace(require=services.__getitem__, provide=provide, data_root=tmp_path)
+    await register_tools(ctx, description="fixture tools")
+    assert [ref.name for ref in services[FEED_TOOLS].refs] == ["feed_manage", "feed_query"]
+    assert registrations["feed_query"]["idempotent"] is True
+    assert registrations["feed_manage"]["idempotent"] is False
 
-    # 每个 opener 必须固定自己的目标，不能都指向循环的最后一项。
-    for item in records:
-        record = registrations[f"mcp_feed__{item['name']}"]
-        async with record["open"]({}) as tool:
-            assert tool.idempotent == record["idempotent"]
-            arguments = await tool.prepare({})
-            result = await tool.invoke("one", arguments)
-            assert result.outcome == "success"
-            assert result.parts[0].value == "remote result"
-            assert calls[-1] == (item["name"], {})
-            assert await tool.query("one") is None
-            assert (await tool.invoke("two", {"fail_tool": True})).outcome == "error"
-            with pytest.raises(ConnectionError, match="disconnected"):
-                await tool.invoke("three", {"fail_transport": True})
-        assert opened[-1] == "route closed"
+    # 参数在执行前按 schema 校验，非法动作不触达数据库。
+    async with registrations["feed_manage"]["open"]({}) as manage:
+        assert "参数错误" in str(await manage.prepare({"action": "drop"}))
+        arguments = await manage.prepare({"action": "subscribe", "name": "Example", "url": "https://example.com/feed.xml"})
+        assert (await manage.invoke("one", arguments)).outcome == "success"
+        listed = await manage.invoke("two", await manage.prepare({"action": "list"}))
+        assert "Example" in str(listed.parts[0].value)
+        failed = await manage.invoke("three", await manage.prepare({"action": "subscribe"}))
+        assert failed.outcome == "error"
+        assert await manage.query("one") is None
+    assert (tmp_path / "feed_mcp.sqlite3").exists()
 
-    # 目录过期必须在远程调用前明确失败。
-    item = records[0]
-    server.tools[item["name"]].input_schema = {"type": "object", "properties": {"changed": {"type": "string"}}}
-    count = len(calls)
-    with pytest.raises(RuntimeError, match="schema"):
-        async with registrations[f"mcp_feed__{item['name']}"]["open"]({}):
-            pytest.fail("schema drift opened a tool")
-    assert len(calls) == count
+    async with registrations["feed_query"]["open"]({}) as query:
+        assert "参数错误" in str(await query.prepare({"action": "latest", "limit": 99}))
+        result = await query.invoke("four", await query.prepare({"action": "summary"}))
+        assert "sources=1" in str(result.parts[0].value)

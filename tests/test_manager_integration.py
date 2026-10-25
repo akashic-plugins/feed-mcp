@@ -221,7 +221,7 @@ def _sqlite_hashes(path: Path) -> dict[str, str]:
 
 
 @pytest.mark.asyncio
-async def test_manager_real_mcp_and_timer_handoff(
+async def test_manager_real_tool_and_timer_handoff(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -262,7 +262,7 @@ async def test_manager_real_mcp_and_timer_handoff(
         formal_timer = next(timer for timer in timers if timer.handles)
 
         refs = root.context.require(ALL_TOOLS)().refs
-        target = next(ref for ref in refs if ref.name == "mcp_feed__feed_query")
+        target = next(ref for ref in refs if ref.name == "feed_query")
         bindings = root.context.require(BINDINGS)
         identity = await root.context.require(TOOLS).bind(target, bindings)
         async with old.fiber.context.runtime_scope(), open_tool(bindings, identity) as tool:

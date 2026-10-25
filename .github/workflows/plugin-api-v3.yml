@@ -63,8 +63,8 @@ jobs:
         env:
           AKASHIC_AGENT_ROOT: .cache/akashic-core
           PYTHONPATH: ${{ github.workspace }}:.cache/akashic-core:mcp/.venv/lib/python3.13/site-packages:${{ github.workspace }}/.cache/akashic-core/sdk/python/src
-        run: mcp/.venv/bin/pyright plugin.py content_source.py legacy_handoff.py feed_runtime mcp/run_mcp.py mcp/src mcp/scripts scripts
+        run: mcp/.venv/bin/pyright plugin.py content_source.py legacy_handoff.py tools.py script_runner.py script_tool.py feed_runtime mcp/scripts scripts
       - name: Compile Python sources
-        run: python -m compileall -q plugin.py content_source.py legacy_handoff.py feed_runtime mcp/run_mcp.py mcp/src mcp/scripts scripts tests
+        run: python -m compileall -q plugin.py content_source.py legacy_handoff.py tools.py script_runner.py script_tool.py feed_runtime mcp/scripts scripts tests
       - name: Check diff formatting
         run: git diff --check

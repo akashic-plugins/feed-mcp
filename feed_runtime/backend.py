@@ -1104,8 +1104,11 @@ def _source_line(row: sqlite3.Row) -> str:
     return line
 
 
-def feed_manage(action: str, name: str = "", url: str = "", source_type: str = "rss", note: str = "") -> str:
-    cfg = load_config()
+def feed_manage(
+    action: str, name: str = "", url: str = "", source_type: str = "rss", note: str = "",
+    *, data_root: Path | None = None,
+) -> str:
+    cfg = load_config(data_root)
     conn = _connect(cfg)
     try:
         action = action.strip().lower()
@@ -1248,8 +1251,10 @@ def feed_query(
     limit: int = 5,
     page: int = 1,
     page_size: int = 20,
+    *,
+    data_root: Path | None = None,
 ) -> str:
-    cfg = load_config()
+    cfg = load_config(data_root)
     conn = _connect(cfg)
     try:
         trace_id = _trace_id_short()
