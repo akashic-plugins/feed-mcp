@@ -10,6 +10,11 @@ from plugins.mcp.contract import MCP_SERVERS, McpServerDefinition
 from plugins.timer.contract import TIMERS
 
 from .content_source import CONTENT_SOURCE_ID, FeedContentRuntime
+from .feed_runtime.events import ScriptOutcome, failed
+from .feed_runtime.scripts import ScriptSource
+from .script_runner import FEED_SCRIPTS, ScriptRunner
+from .script_tool import register_script_tool
+from plugins.host_execution.contract import PROCESSES
 
 
 class FeedConfig(BaseModel):
@@ -20,8 +25,8 @@ from plugins.eventmail.contract import EVENTMAIL_CONTENT_SOURCE
 
 api_version = 3
 name = "feed"
-version = "3.1.6"
-desc = "由 Timer 驱动的 Feed Content source 与用户 MCP"
+version = "3.2.0"
+desc = "订阅 RSS 与脚本来源，定时抓取为格式统一的事件并投递"
 inject = (TOOLS, MCP_SERVERS, TIMERS)
 skill_roots = ("skills",)
 
@@ -51,10 +56,18 @@ async def apply(ctx: Context) -> None:
             lambda: content.close,
             label="feed-content-source-binding",
         )
+
+        async def run_script(source: ScriptSource) -> ScriptOutcome:
+            with source_ctx.borrow(FEED_SCRIPTS) as runner:
+                if runner is None:
+                    return failed("unavailable", "宿主进程服务未就绪，脚本来源暂不执行")
+                return await runner.run(owner=f"feed-source:{source.source_id}", code=source.code)
+
         runtime = FeedContentRuntime(
             source_ctx.data_root,
             source_ctx.require(TIMERS),
             content,
+            run_script=run_script,
         )
         _ = await source_ctx.effect(
             lambda: runtime.close,
@@ -68,3 +81,11 @@ async def apply(ctx: Context) -> None:
         apply_eventmail,
         name="feed-eventmail-source",
     )
+
+    # 3. 宿主进程服务存在时，独立子 Fiber 提供脚本执行与 feed_script 工具；缺席不影响 RSS。
+    async def apply_scripts(scripts_ctx: Context) -> None:
+        runner = ScriptRunner(scripts_ctx, scripts_ctx.require(PROCESSES))
+        _ = await scripts_ctx.provide(FEED_SCRIPTS, runner)
+        _ = await register_script_tool(scripts_ctx, runner)
+
+    _ = await ctx.inject((TOOLS, PROCESSES), apply_scripts, name="feed-scripts")

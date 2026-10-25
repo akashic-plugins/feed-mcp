@@ -172,6 +172,63 @@ def save_script(
         conn.close()
 
 
+def script_history(*, data_root: Path, name: str) -> str:
+    conn = backend._connect(backend.load_config(data_root))
+    try:
+        row = _source_by_name(conn, name)
+        if row is None or str(row["type"]) != SOURCE_TYPE:
+            return f"没有名为 {name!r} 的脚本来源"
+        versions = conn.execute(
+            "SELECT version, note, created_at, test_report FROM source_scripts WHERE source_id = ? ORDER BY version DESC",
+            (str(row["id"]),),
+        ).fetchall()
+        lines = [f"{row['name']}  {row['url']}  生效 v{row['script_version']}"]
+        for item in versions:
+            mark = "*" if item["version"] == row["script_version"] else " "
+            first = str(item["test_report"]).splitlines()[0]
+            lines.append(f"{mark} v{item['version']}  {item['created_at'][:16]}  {first}  {item['note'] or ''}".rstrip())
+        return "\n".join(lines)
+    finally:
+        conn.close()
+
+
+def script_code(*, data_root: Path, name: str, version: int | None) -> str | None:
+    conn = backend._connect(backend.load_config(data_root))
+    try:
+        row = _source_by_name(conn, name)
+        if row is None or str(row["type"]) != SOURCE_TYPE:
+            return None
+        found = conn.execute(
+            "SELECT code FROM source_scripts WHERE source_id = ? AND version = ?",
+            (str(row["id"]), version or row["script_version"]),
+        ).fetchone()
+        return None if found is None else str(found["code"])
+    finally:
+        conn.close()
+
+
+def use_version(*, data_root: Path, name: str, version: int) -> str:
+    conn = backend._connect(backend.load_config(data_root))
+    try:
+        row = _source_by_name(conn, name)
+        if row is None or str(row["type"]) != SOURCE_TYPE:
+            return f"没有名为 {name!r} 的脚本来源"
+        exists = conn.execute(
+            "SELECT 1 FROM source_scripts WHERE source_id = ? AND version = ?", (str(row["id"]), version)
+        ).fetchone()
+        if exists is None:
+            return f"错误：{name!r} 没有 v{version}"
+        conn.execute(
+            "UPDATE sources SET script_version = ?, updated_at = ? WHERE id = ?",
+            (version, backend._now().isoformat(), str(row["id"])),
+        )
+        conn.execute("UPDATE poll_state SET last_polled_at = NULL WHERE source_id = ?", (str(row["id"]),))
+        conn.commit()
+        return f"已切换 {str(row['name'])!r} 到脚本 v{version}，下一轮轮询生效"
+    finally:
+        conn.close()
+
+
 def _source_by_name(conn: sqlite3.Connection, name: str) -> sqlite3.Row | None:
     rows = conn.execute("SELECT * FROM sources WHERE lower(name) = lower(?)", (name.strip(),)).fetchall()
     return rows[0] if len(rows) == 1 else None
