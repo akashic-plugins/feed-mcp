@@ -248,6 +248,21 @@ def _connect(cfg: FeedMcpConfig) -> sqlite3.Connection:
         )
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS source_scripts (
+            source_id TEXT NOT NULL,
+            version INTEGER NOT NULL,
+            code TEXT NOT NULL,
+            note TEXT,
+            test_report TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY(source_id, version)
+        )
+        """
+    )
+    _add_columns(conn, "sources", {"script_version": "INTEGER"})
+    _add_columns(conn, "poll_state", {"last_status": "TEXT", "last_count": "INTEGER"})
     _ensure_rank_stats(conn)
     _ensure_rank_model(conn, cfg)
     _normalize_existing_source_urls(conn)
@@ -288,6 +303,19 @@ def _migrate_items_schema(conn: sqlite3.Connection) -> None:
                 conn.execute(f"ALTER TABLE items DROP COLUMN {column}")
 
 
+# 列已齐时不拿写锁；缺列时在写锁内复查，并发连接只有一个执行 DDL。
+def _add_columns(conn: sqlite3.Connection, table: str, additions: dict[str, str]) -> None:
+    present = {str(row["name"]) for row in conn.execute(f"PRAGMA table_info({table})")}
+    if present.issuperset(additions):
+        return
+    with conn:
+        conn.execute("BEGIN IMMEDIATE")
+        columns = {str(row["name"]) for row in conn.execute(f"PRAGMA table_info({table})")}
+        for column, declaration in additions.items():
+            if column not in columns:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
+
+
 def _now() -> datetime:
     return datetime.now(UTC)
 
@@ -318,6 +346,10 @@ def _delete_source_history(conn: sqlite3.Connection, source_ids: list[str]) -> t
     deleted_items = max(0, cursor.rowcount)
     conn.execute(
         f"DELETE FROM poll_state WHERE source_id IN ({source_placeholders})",
+        source_ids,
+    )
+    conn.execute(
+        f"DELETE FROM source_scripts WHERE source_id IN ({source_placeholders})",
         source_ids,
     )
     return deleted_items, deleted_acked
@@ -401,7 +433,8 @@ def _normalize_x_status_url(url: str) -> str | None:
         return None
     username = match.group(1).lstrip("@")
     status_id = match.group(2)
-    return f"https://nitter.net/{username}/status/{status_id}#m"
+    # nitter 已停止服务；条目链接统一指回 x.com，身份仍由 xstatus:<id> 决定。
+    return f"https://x.com/{username}/status/{status_id}"
 
 
 def _normalize_source_url(url: str) -> str:
@@ -479,6 +512,7 @@ def _normalize_existing_item_urls(conn: sqlite3.Connection) -> None:
         WHERE url LIKE '%twitter.com/%'
            OR url LIKE '%x.com/%'
            OR url LIKE '%xcancel.com/%'
+           OR url LIKE '%nitter.net/%'
         """
     ).fetchall()
     for row in rows:
@@ -493,7 +527,8 @@ def _normalize_existing_item_urls(conn: sqlite3.Connection) -> None:
 
 
 def _normalize_existing_source_urls(conn: sqlite3.Connection) -> None:
-    rows = conn.execute("SELECT id, url FROM sources").fetchall()
+    # 脚本来源的地址是脚本要打开的页面，不能改写成 RSS 地址。
+    rows = conn.execute("SELECT id, url FROM sources WHERE type != 'script'").fetchall()
     for row in rows:
         normalized_url = _normalize_source_url(str(row["url"] or ""))
         if normalized_url == row["url"]:
@@ -875,14 +910,37 @@ def _poll_source(
 
     # 1. 按 source_type 拉取原始条目（rss / novel-kb），使用静态抓取上限。
     parsed = _fetch_source_items(source, cfg.max_content_events, trace_id=trace_id)
-    parsed_count = len(parsed)
+
+    # 2. 写入条目，再记录本轮成功状态。
+    counts = _ingest_items(conn, source, parsed, now)
+    _record_poll_success(conn, source_id, now, "ok" if parsed else "empty", len(parsed))
+    conn.commit()
+    logger.info(
+        "[feed][trace=%s] source=%s poll done parsed=%d valid=%d inserted=%d updated=%d skipped_empty=%d sample_titles=%s",
+        trace_id,
+        source_name,
+        len(parsed),
+        counts["valid"],
+        counts["inserted"],
+        counts["updated"],
+        counts["skipped_empty"],
+        counts["sample_titles"],
+    )
+
+
+# 规范化一批原始条目并写入 items；RSS 与脚本来源共用这一条入库路径。
+def _ingest_items(
+    conn: sqlite3.Connection,
+    source: sqlite3.Row,
+    parsed: list[dict[str, str | None]],
+    now: datetime,
+) -> dict[str, Any]:
+    source_id = str(source["id"])
     valid_count = 0
     skipped_empty_count = 0
     inserted_count = 0
     updated_count = 0
     sample_titles: list[str] = []
-
-    # 2. 规范化条目并写入 sqlite，统计本轮新增/更新情况。
     for item in parsed:
         title = str(item.get("title") or "").strip()
         content = str(item.get("content") or "").strip()
@@ -949,30 +1007,49 @@ def _poll_source(
                 content_hash,
             ),
         )
+    return {
+        "valid": valid_count,
+        "inserted": inserted_count,
+        "updated": updated_count,
+        "skipped_empty": skipped_empty_count,
+        "sample_titles": sample_titles,
+    }
 
-    # 3. 更新 poll 状态并输出本轮摘要日志，便于排查“是否真的拉到内容”。
+
+def _record_poll_success(
+    conn: sqlite3.Connection, source_id: str, now: datetime, status: str, count: int
+) -> None:
     conn.execute(
         """
-        INSERT INTO poll_state (source_id, last_polled_at, last_success_at, last_error)
-        VALUES (?, ?, ?, ?)
+        INSERT INTO poll_state (
+            source_id, last_polled_at, last_success_at, last_error, last_status, last_count
+        ) VALUES (?, ?, ?, NULL, ?, ?)
         ON CONFLICT(source_id) DO UPDATE SET
             last_polled_at=excluded.last_polled_at,
             last_success_at=excluded.last_success_at,
-            last_error=NULL
+            last_error=NULL,
+            last_status=excluded.last_status,
+            last_count=excluded.last_count
         """,
-        (source_id, now.isoformat(), now.isoformat(), None),
+        (source_id, now.isoformat(), now.isoformat(), status, count),
     )
-    conn.commit()
-    logger.info(
-        "[feed][trace=%s] source=%s poll done parsed=%d valid=%d inserted=%d updated=%d skipped_empty=%d sample_titles=%s",
-        trace_id,
-        source_name,
-        parsed_count,
-        valid_count,
-        inserted_count,
-        updated_count,
-        skipped_empty_count,
-        sample_titles,
+
+
+def _record_poll_failure(
+    conn: sqlite3.Connection, source_id: str, now: datetime, status: str, error: str
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO poll_state (
+            source_id, last_polled_at, last_success_at, last_error, last_status, last_count
+        ) VALUES (?, ?, NULL, ?, ?, 0)
+        ON CONFLICT(source_id) DO UPDATE SET
+            last_polled_at=excluded.last_polled_at,
+            last_error=excluded.last_error,
+            last_status=excluded.last_status,
+            last_count=0
+        """,
+        (source_id, now.isoformat(), error, status),
     )
 
 
@@ -998,16 +1075,7 @@ def _poll_rows(
                 row["name"],
                 _err_text(e),
             )
-            conn.execute(
-                """
-                INSERT INTO poll_state (source_id, last_polled_at, last_success_at, last_error)
-                VALUES (?, ?, NULL, ?)
-                ON CONFLICT(source_id) DO UPDATE SET
-                    last_polled_at=excluded.last_polled_at,
-                    last_error=excluded.last_error
-                """,
-                (row["id"], _now().isoformat(), repr(e)),
-            )
+            _record_poll_failure(conn, str(row["id"]), _now(), "error", repr(e))
             conn.commit()
     return {
         "total": len(rows),
@@ -1017,6 +1085,25 @@ def _poll_rows(
     }
 
 
+# 一行来源摘要：健康状态取自最近一次轮询，失败时带上原因，便于判断要不要修脚本。
+def _source_line(row: sqlite3.Row) -> str:
+    enabled = "启用" if int(row["enabled"]) else "停用"
+    kind = f"script v{row['script_version']}" if row["type"] == "script" else str(row["type"])
+    health = "未抓取"
+    if row["last_status"]:
+        health = f"{row['last_status']} {row['last_count'] or 0} 条"
+    elif row["last_error"]:
+        health = "error"
+    if row["last_success_at"]:
+        health += f"，上次成功 {str(row['last_success_at'])[:16]}"
+    line = f"  [{enabled}] {row['name']}  ({kind}; {health})  {row['url']}"
+    if row["last_error"]:
+        line += f"\n      最近错误: {str(row['last_error'])[:200]}"
+    if row["note"]:
+        line += f"  备注: {row['note']}"
+    return line
+
+
 def feed_manage(action: str, name: str = "", url: str = "", source_type: str = "rss", note: str = "") -> str:
     cfg = load_config()
     conn = _connect(cfg)
@@ -1024,15 +1111,18 @@ def feed_manage(action: str, name: str = "", url: str = "", source_type: str = "
         action = action.strip().lower()
         if action == "list":
             rows = conn.execute(
-                "SELECT name, type, url, enabled, note FROM sources ORDER BY added_at DESC"
+                """
+                SELECT s.name, s.type, s.url, s.enabled, s.note, s.script_version,
+                       p.last_success_at, p.last_status, p.last_count, p.last_error
+                FROM sources s LEFT JOIN poll_state p ON p.source_id = s.id
+                ORDER BY s.added_at DESC
+                """
             ).fetchall()
             if not rows:
                 return "当前没有订阅任何信息源"
-            lines = [f"RSS 订阅列表（共 {len(rows)} 个）："]
+            lines = [f"订阅列表（共 {len(rows)} 个）："]
             for row in rows:
-                status = "启用" if int(row["enabled"]) else "停用"
-                note_text = f"  备注: {row['note']}" if row["note"] else ""
-                lines.append(f"  [{status}] {row['name']}  {row['url']}{note_text}")
+                lines.append(_source_line(row))
             return "\n".join(lines)
 
         if action == "unsubscribe":
@@ -1057,6 +1147,8 @@ def feed_manage(action: str, name: str = "", url: str = "", source_type: str = "
         if action == "subscribe":
             if not name.strip() or not url.strip():
                 return "错误：subscribe 需要 name 和 url"
+            if source_type == "script":
+                return "错误：脚本来源用 feed_script 的 save 创建，保存前会先试跑"
             normalized_url = _normalize_source_url(url)
             duplicate = conn.execute(
                 "SELECT id, name FROM sources WHERE url = ? LIMIT 1",
@@ -1094,7 +1186,7 @@ def feed_manage(action: str, name: str = "", url: str = "", source_type: str = "
             if not exact_name:
                 return f"错误：{action} 需要 name"
             rows = conn.execute(
-                "SELECT id, name, url, enabled FROM sources WHERE lower(name) = lower(?)",
+                "SELECT id, name, url, enabled, type FROM sources WHERE lower(name) = lower(?)",
                 (exact_name,),
             ).fetchall()
             if not rows:
@@ -1117,6 +1209,8 @@ def feed_manage(action: str, name: str = "", url: str = "", source_type: str = "
 
             if not url.strip():
                 return "错误：update 需要 url"
+            if source["type"] == "script":
+                return "错误：脚本来源的地址随脚本一起用 feed_script 的 save 更新"
             normalized_url = _normalize_source_url(url)
             duplicate = conn.execute(
                 "SELECT name FROM sources WHERE url = ? AND id != ? LIMIT 1",
@@ -2057,8 +2151,9 @@ def poll_feeds_only(*, data_root: Path | None = None) -> None:
     conn = _connect(cfg)
     try:
         trace_id = _trace_id_short()
+        # 脚本来源要在宿主执行，由插件运行时单独轮询。
         sources = conn.execute(
-            "SELECT * FROM sources WHERE enabled = 1 ORDER BY added_at DESC"
+            "SELECT * FROM sources WHERE enabled = 1 AND type != 'script' ORDER BY added_at DESC"
         ).fetchall()
         logger.info("[feed][trace=%s] poll_feeds_only: %d sources", trace_id, len(sources))
         summary = _poll_rows(conn, cfg, sources, force=False, trace_id=trace_id)
