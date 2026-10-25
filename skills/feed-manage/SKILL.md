@@ -7,7 +7,7 @@ description: 管理和查询信息来源订阅（RSS 与脚本来源）。用户
 
 Feed 把每个来源的内容统一成**事件**，去重、排序、投递都由 Feed 负责。来源只有两种：
 
-- **RSS**：有现成 feed 地址，用 `mcp_feed__feed_manage(action="subscribe")`。
+- **RSS**：有现成 feed 地址，用 `feed_manage(action="subscribe")`。
 - **脚本**：没有 RSS 的页面，写一段宿主 shell 脚本抓取，用 `feed_script` 试跑、保存。
 
 无论哪种，最后都必须收敛成下面这一种事件格式。
@@ -69,7 +69,7 @@ Feed 把每个来源的内容统一成**事件**，去重、排序、投递都�
 
 ## 维护
 
-- `mcp_feed__feed_manage(action="list")`：所有来源及健康（最近状态、条数、上次成功时间、最近错误）。
+- `feed_manage(action="list")`：所有来源及健康（最近状态、条数、上次成功时间、最近错误）。
 - 某个脚本来源连续报 `invalid`/`error`/`stale`：`feed_script(action="show", name=…)` 看当前代码，修好后 test → save 出新版本。
 - `feed_script(action="history", name=…)` 看版本；新版本不如旧版时 `feed_script(action="use", name=…, version=N)` 回滚。
 - `login_required`/`blocked` 不是脚本问题：告诉用户需要在浏览器里重新登录或该站点挡住了自动访问，不要反复改脚本。
@@ -77,14 +77,14 @@ Feed 把每个来源的内容统一成**事件**，去重、排序、投递都�
 ## 查询与订阅管理
 
 ```
-mcp_feed__feed_manage(action="list")
-mcp_feed__feed_manage(action="subscribe", name="名称", url="RSS地址")
-mcp_feed__feed_manage(action="unsubscribe", name="名称")      # 删除历史内容
-mcp_feed__feed_manage(action="pause" | "resume", name="完整名称")   # 保留历史
-mcp_feed__feed_manage(action="update", name="完整名称", url="新 RSS 地址")
-mcp_feed__feed_query(action="latest", limit=10, source="名称")
-mcp_feed__feed_query(action="summary")
-mcp_feed__feed_query(action="search", keyword="关键词")
+feed_manage(action="list")
+feed_manage(action="subscribe", name="名称", url="RSS地址")
+feed_manage(action="unsubscribe", name="名称")      # 删除历史内容
+feed_manage(action="pause" | "resume", name="完整名称")   # 保留历史
+feed_manage(action="update", name="完整名称", url="新 RSS 地址")
+feed_query(action="latest", limit=10, source="名称")
+feed_query(action="summary")
+feed_query(action="search", keyword="关键词")
 ```
 
 - 问"你有什么信息来源"时，先调 `feed_manage(action="list")` 拿完整列表再回答，不得凭记忆列举；之前调过也要重新调用。

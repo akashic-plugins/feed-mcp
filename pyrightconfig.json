@@ -3,9 +3,10 @@
     "plugin.py",
     "content_source.py",
     "legacy_handoff.py",
+    "tools.py",
+    "script_runner.py",
+    "script_tool.py",
     "feed_runtime",
-    "mcp/run_mcp.py",
-    "mcp/src",
     "scripts",
     "tests"
   ],

@@ -1,1 +1,0 @@
-# feed-mcp package

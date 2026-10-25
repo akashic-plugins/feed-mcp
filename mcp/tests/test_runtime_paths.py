@@ -7,7 +7,6 @@ from pathlib import Path
 import pytest
 
 from feed_test_plugin import plugin
-from run_mcp import _runtime_dir
 from feed_runtime import backend as feed_backend
 from feed_runtime.backend import _config_path, _runtime_root, load_config
 
@@ -16,8 +15,6 @@ def test_runtime_entrypoints_reject_missing_data_dir(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("AKA_PLUGIN_DATA_DIR", "   ")
-    with pytest.raises(RuntimeError, match="AKA_PLUGIN_DATA_DIR"):
-        _runtime_dir()
     with pytest.raises(RuntimeError, match="AKA_PLUGIN_DATA_DIR"):
         _runtime_root()
     with pytest.raises(RuntimeError, match="AKA_PLUGIN_DATA_DIR"):

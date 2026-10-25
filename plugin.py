@@ -6,7 +6,6 @@ from .tools import register_tools
 from pydantic import BaseModel
 
 from agent.plugin_composition import RUNTIME_STARTED, RUNTIME_STOPPING, Context
-from plugins.mcp.contract import MCP_SERVERS, McpServerDefinition
 from plugins.timer.contract import TIMERS
 
 from .content_source import CONTENT_SOURCE_ID, FeedContentRuntime
@@ -25,28 +24,17 @@ from plugins.eventmail.contract import EVENTMAIL_CONTENT_SOURCE
 
 api_version = 3
 name = "feed"
-version = "3.2.0"
+version = "3.3.0"
 desc = "订阅 RSS 与脚本来源，定时抓取为格式统一的事件并投递"
-inject = (TOOLS, MCP_SERVERS, TIMERS)
+inject = (TOOLS, TIMERS)
 skill_roots = ("skills",)
 
 
 async def apply(ctx: Context) -> None:
-    """注册用户 MCP 工具和一个普通 Timer 驱动的 Content source。"""
+    """注册 Feed 工具组、Timer 驱动的 Content source 与宿主脚本执行。"""
     _ = FeedConfig.model_validate(ctx.config)
 
-    # 1. MCP 只拥有用户触发的订阅管理和缓存查询。
-    await ctx.require(MCP_SERVERS).register(
-        ctx,
-        McpServerDefinition(
-            name="feed",
-            command=("python", "mcp/run_mcp.py"),
-            required_tools=("feed_manage", "feed_query"),
-            candidate_read_only_tools=(),
-            candidate_env={"FEED_BACKEND": "recording"},
-        ),
-    )
-
+    # 1. 订阅管理与缓存查询是原生工具，直接读写本插件数据目录。
     await register_tools(ctx, description=desc)
 
     # 2. EventMail 存在时，独立子 Fiber 才启动主动来源。

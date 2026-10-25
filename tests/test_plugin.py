@@ -13,9 +13,7 @@ import pytest
 from feed_test_plugin import plugin  # pyright: ignore[reportMissingImports]
 from plugins.timer.timer import AsyncioOneShotTimer
 from agent.plugin_composition import Context, CompositionRoot, Fiber, PluginRuntime
-from plugins.mcp.contract import MCP_SERVERS
 from plugins.timer.contract import TIMERS
-from plugins.mcp.contract import McpServerDefinition, McpServers
 from agent.plugin_composition.tasks import TASKS, PluginTasks
 from agent.plugins.composable import ComposablePlugin
 from agent.plugins.static_manifest import load_static_plugin_manifest
@@ -26,16 +24,6 @@ from plugins.eventmail.contract import (
 
 
 ROOT = Path(__file__).resolve().parents[1]
-
-
-class _RecordingMcpServers:
-    """Capture declarations; manager integration tests exercise the real provider."""
-
-    def __init__(self) -> None:
-        self.definitions: dict[str, McpServerDefinition] = {}
-
-    async def register(self, _ctx: object, definition: McpServerDefinition) -> None:
-        self.definitions[definition.name] = definition
 
 
 async def _mount_tools(
@@ -102,19 +90,17 @@ async def _never_sleep(_seconds: float) -> None:
 def test_pure_v3_exports_and_exact_apply() -> None:
     assert plugin.api_version == 3
     assert plugin.name == "feed"
-    assert plugin.version == "3.2.0"
+    assert plugin.version == "3.3.0"
     assert plugin.skill_roots == ("skills",)
     assert tuple(inspect.signature(plugin.apply).parameters) == ("ctx",)
 
 
 @pytest.mark.asyncio
-async def test_apply_registers_user_mcp_and_dormant_content_runtime(
+async def test_apply_registers_native_tools_and_dormant_content_runtime(
     tmp_path: Path,
 ) -> None:
     root = CompositionRoot("feed:test")
-    servers = _RecordingMcpServers()
     sources = _Sources()
-    await root.context.provide(MCP_SERVERS, cast(McpServers, servers))
     await root.context.provide(
         TIMERS,
         AsyncioOneShotTimer(),
@@ -140,10 +126,6 @@ async def test_apply_registers_user_mcp_and_dormant_content_runtime(
             ),
         )
 
-        mcp = servers.definitions["feed"]
-        assert mcp.required_tools == ("feed_manage", "feed_query")
-        assert mcp.candidate_read_only_tools == ()
-        assert mcp.candidate_env == {"FEED_BACKEND": "recording"}
         assert sources.bound == ["feed-subscriptions"]
         assert data_dir.is_dir()
         topology = root.topology_view()
@@ -151,7 +133,7 @@ async def test_apply_registers_user_mcp_and_dormant_content_runtime(
             "serial:runtime.started:feed/feed-eventmail-source",
             "serial:runtime.stopping:feed/feed-eventmail-source",
         )
-        assert any(item["name"].startswith("mcp_feed__") for item in (ref.description for ref in root.context.require(FEED_TOOLS).refs))
+        assert [ref.name for ref in root.context.require(FEED_TOOLS).refs] == ["feed_manage", "feed_query"]
     finally:
         await tasks.close()
         await tools_fiber.dispose()
@@ -160,10 +142,8 @@ async def test_apply_registers_user_mcp_and_dormant_content_runtime(
 
 
 @pytest.mark.asyncio
-async def test_apply_keeps_user_mcp_without_eventmail(tmp_path: Path) -> None:
+async def test_apply_keeps_native_tools_without_eventmail(tmp_path: Path) -> None:
     root = CompositionRoot("feed:without-eventmail")
-    servers = _RecordingMcpServers()
-    await root.context.provide(MCP_SERVERS, cast(McpServers, servers))
     await root.context.provide(TIMERS, AsyncioOneShotTimer())
     tasks, tools_fiber = await _mount_tools(root, tmp_path)
     try:
@@ -184,8 +164,7 @@ async def test_apply_keeps_user_mcp_without_eventmail(tmp_path: Path) -> None:
             ),
         )
 
-        assert "feed" in servers.definitions
-        assert any(item["name"].startswith("mcp_feed__") for item in (ref.description for ref in root.context.require(FEED_TOOLS).refs))
+        assert [ref.name for ref in root.context.require(FEED_TOOLS).refs] == ["feed_manage", "feed_query"]
     finally:
         await tasks.close()
         await tools_fiber.dispose()
@@ -196,7 +175,7 @@ def test_static_manifest_reads_identity_and_runtime_requirements() -> None:
     manifest = load_static_plugin_manifest(ROOT)
 
     assert manifest.name == "feed"
-    assert manifest.version == plugin.version == "3.2.0"
+    assert manifest.version == plugin.version == "3.3.0"
     assert manifest.api_version == 3
     assert manifest.requirements == (
         "mcp/requirements.txt",
