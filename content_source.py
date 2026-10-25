@@ -5,7 +5,7 @@ import hashlib
 import json
 import logging
 import sys
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -13,10 +13,14 @@ from typing import cast
 
 from plugins.timer.contract import OneShotTimer, TimerHandle, TimerStatus
 
-from .feed_runtime import CONTENT_SOURCE_ID, backend
+from .feed_runtime import CONTENT_SOURCE_ID, backend, scripts
+from .feed_runtime.events import ScriptOutcome, failed
+from .feed_runtime.scripts import ScriptSource
 
 
 from plugins.eventmail.contract import BoundContentSource
+
+ScriptExecutor = Callable[[ScriptSource], Awaitable[ScriptOutcome]]
 
 
 class FeedContentRuntime:
@@ -29,10 +33,12 @@ class FeedContentRuntime:
         content: BoundContentSource,
         *,
         now: Callable[[], datetime] | None = None,
+        run_script: ScriptExecutor | None = None,
     ) -> None:
         self._data_root = data_root
         self._timers = timers
         self._content = content
+        self._run_script = run_script
         self._now = now or (lambda: datetime.now(UTC))
         self._handle: TimerHandle | None = None
         self._task: asyncio.Task[None] | None = None
@@ -100,6 +106,7 @@ class FeedContentRuntime:
             await asyncio.to_thread(
                 backend.poll_feeds_only, data_root=self._data_root
             )
+            polled_scripts = await self._poll_scripts()
             items = await _prepare_content_items(
                 self._data_root, self._aware_now()
             )
@@ -124,10 +131,11 @@ class FeedContentRuntime:
                 deadline=next_due,
             )
             self._log.info(
-                "poll committed items=%d inserted=%d settled=%d next_due=%s",
+                "poll committed items=%d inserted=%d settled=%d scripts=%d next_due=%s",
                 len(items),
                 submitted,
                 settled,
+                polled_scripts,
                 next_due.isoformat(),
             )
         finally:
@@ -141,6 +149,32 @@ class FeedContentRuntime:
                 now=self._aware_now(),
             )
             self._arm(deadline)
+
+    # 串行执行到期的脚本来源：共用一个已登录浏览器的脚本不会互相抢页面；
+    # 单个来源失败只记进它自己的轮询状态，不影响其他来源和本轮投递。
+    async def _poll_scripts(self) -> int:
+        if self._run_script is None:
+            return 0
+        due = await asyncio.to_thread(
+            scripts.due_script_sources, data_root=self._data_root, now=self._aware_now()
+        )
+        for source in due:
+            # 关闭时不再开始新的脚本，卸载最多等当前这一个结束。
+            if self._closed:
+                break
+            try:
+                outcome = await self._run_script(source)
+            except Exception as error:
+                outcome = failed("error", f"{type(error).__name__}: {error}")
+            self._log.info(
+                "script source=%s v%d status=%s events=%d",
+                source.name, source.version, outcome.status, len(outcome.events),
+            )
+            await asyncio.to_thread(
+                scripts.record_outcome, data_root=self._data_root, source=source,
+                outcome=outcome, now=self._aware_now(),
+            )
+        return len(due)
 
     async def _settle_delivered(self) -> int:
         """用精确 Feed revision 收束每条已投递 Content receipt。"""
