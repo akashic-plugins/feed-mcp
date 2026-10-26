@@ -90,7 +90,7 @@ async def _never_sleep(_seconds: float) -> None:
 def test_pure_v3_exports_and_exact_apply() -> None:
     assert plugin.api_version == 3
     assert plugin.name == "feed"
-    assert plugin.version == "3.3.0"
+    assert plugin.version == "3.3.1"
     assert plugin.skill_roots == ("skills",)
     assert tuple(inspect.signature(plugin.apply).parameters) == ("ctx",)
 
@@ -175,7 +175,7 @@ def test_static_manifest_reads_identity_and_runtime_requirements() -> None:
     manifest = load_static_plugin_manifest(ROOT)
 
     assert manifest.name == "feed"
-    assert manifest.version == plugin.version == "3.3.0"
+    assert manifest.version == plugin.version == "3.3.1"
     assert manifest.api_version == 3
     assert manifest.requirements == (
         "mcp/requirements.txt",

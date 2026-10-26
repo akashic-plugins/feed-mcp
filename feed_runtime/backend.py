@@ -18,6 +18,7 @@ import re
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 import uuid
 import xml.etree.ElementTree as ET
@@ -117,11 +118,31 @@ def load_config(data_root: Path | None = None) -> FeedMcpConfig:
     )
 
 
+# 本进程已完成建表与旧数据规整的数据库文件；按路径+inode 识别，换库后重新准备。
+_PREPARED: set[tuple[str, int]] = set()
+_PREPARED_LOCK = threading.Lock()
+# 准备完成后写进库头的标记；删库重建可能复用 inode，命中缓存时仍核对库自身的标记。
+_PREPARED_MARK = 1
+
+
 def _connect(cfg: FeedMcpConfig) -> sqlite3.Connection:
     cfg.db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(cfg.db_path, timeout=30)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA busy_timeout=30000")
+    # 建表、加列与旧数据规整是一次性迁移；每次连接都重跑会全表扫描并写库。
+    with _PREPARED_LOCK:
+        key = (str(cfg.db_path.resolve()), cfg.db_path.stat().st_ino)
+        marked = conn.execute("PRAGMA user_version").fetchone()[0] == _PREPARED_MARK
+        if key not in _PREPARED or not marked:
+            _prepare(conn, cfg)
+            if not marked:
+                conn.execute(f"PRAGMA user_version = {_PREPARED_MARK}")
+            _PREPARED.add(key)
+    return conn
+
+
+def _prepare(conn: sqlite3.Connection, cfg: FeedMcpConfig) -> None:
     # SQLite does not wait reliably when two processes first enable WAL.
     # Serialize only that one-time database mode transition.
     lock_path = cfg.db_path.with_suffix(cfg.db_path.suffix + ".init.lock")
@@ -268,7 +289,6 @@ def _connect(cfg: FeedMcpConfig) -> sqlite3.Connection:
     _normalize_existing_source_urls(conn)
     _normalize_existing_item_urls(conn)
     _normalize_existing_xcancel_items(conn)
-    return conn
 
 
 def _migrate_items_schema(conn: sqlite3.Connection) -> None:
@@ -489,14 +509,16 @@ def _normalize_existing_xcancel_items(conn: sqlite3.Connection) -> None:
             str(row["title"] or ""),
             str(row["published_at"] or "").strip() or None,
         )
-        if normalized_event_id != row["event_id"]:
-            exists = conn.execute(
-                "SELECT 1 FROM items WHERE event_id = ? LIMIT 1",
-                (normalized_event_id,),
-            ).fetchone()
-            if exists is not None:
-                conn.execute("DELETE FROM items WHERE event_id = ?", (row["event_id"],))
-                continue
+        # 已规整的行不再写回；原先每行无条件 UPDATE 会让每次规整都整批写库。
+        if normalized_event_id == row["event_id"]:
+            continue
+        exists = conn.execute(
+            "SELECT 1 FROM items WHERE event_id = ? LIMIT 1",
+            (normalized_event_id,),
+        ).fetchone()
+        if exists is not None:
+            conn.execute("DELETE FROM items WHERE event_id = ?", (row["event_id"],))
+            continue
         conn.execute(
             "UPDATE items SET event_id = ? WHERE event_id = ?",
             (normalized_event_id, row["event_id"]),
