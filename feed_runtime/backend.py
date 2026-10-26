@@ -121,6 +121,8 @@ def load_config(data_root: Path | None = None) -> FeedMcpConfig:
 # 本进程已完成建表与旧数据规整的数据库文件；按路径+inode 识别，换库后重新准备。
 _PREPARED: set[tuple[str, int]] = set()
 _PREPARED_LOCK = threading.Lock()
+# 准备完成后写进库头的标记；删库重建可能复用 inode，命中缓存时仍核对库自身的标记。
+_PREPARED_MARK = 1
 
 
 def _connect(cfg: FeedMcpConfig) -> sqlite3.Connection:
@@ -131,8 +133,11 @@ def _connect(cfg: FeedMcpConfig) -> sqlite3.Connection:
     # 建表、加列与旧数据规整是一次性迁移；每次连接都重跑会全表扫描并写库。
     with _PREPARED_LOCK:
         key = (str(cfg.db_path.resolve()), cfg.db_path.stat().st_ino)
-        if key not in _PREPARED:
+        marked = conn.execute("PRAGMA user_version").fetchone()[0] == _PREPARED_MARK
+        if key not in _PREPARED or not marked:
             _prepare(conn, cfg)
+            if not marked:
+                conn.execute(f"PRAGMA user_version = {_PREPARED_MARK}")
             _PREPARED.add(key)
     return conn
 
