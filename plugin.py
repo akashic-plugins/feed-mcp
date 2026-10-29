@@ -24,7 +24,7 @@ from plugins.eventmail.contract import EVENTMAIL_CONTENT_SOURCE
 
 api_version = 3
 name = "feed"
-version = "3.3.1"
+version = "3.3.2"
 desc = "订阅 RSS 与脚本来源，定时抓取为格式统一的事件并投递"
 inject = (TOOLS, TIMERS)
 skill_roots = ("skills",)

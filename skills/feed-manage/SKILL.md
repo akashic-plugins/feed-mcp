@@ -64,6 +64,18 @@ Feed 把每个来源的内容统一成**事件**，去重、排序、投递都�
    opencli browser feed eval '(async () => { …; return JSON.stringify({status: "ok", events}) })()' | grep '^{' | tail -n 1
    ```
    在 eval 里用 `Date.now() - performance.timeOrigin > 60000` 判断 `stale`，用登录按钮或跳转判断 `login_required`。
+   同一站点的多个账号（例如 X）共用一个会话名：Feed 串行执行脚本，不会互相抢页面。X 整页重载一次约 10 秒 CPU；在已经打开的 X 页面里用站内路由切到**这一页还没看过的**账号，只要约 2.5 秒。已经看过的账号，X 会直接用内存里的旧时间线、不会重新请求，必须整页重载：
+   ```sh
+   MODE=$(opencli browser feed eval '(() => {
+     const h = "anthropicai", seen = window.__feedSeen || [];
+     if (location.host !== "x.com" || Date.now() - performance.timeOrigin > 1800000 || seen.includes(h)) return "full";
+     window.__feedSeen = [...seen, h];
+     history.pushState({}, "", "/AnthropicAI"); dispatchEvent(new PopStateEvent("popstate", {state: {}}));
+     return "spa";
+   })()' 2>/dev/null | grep -E '^(spa|full)$' | tail -n 1 || true)
+   [ "$MODE" = spa ] || { MODE=full; opencli browser feed open "https://x.com/AnthropicAI?_fb=$(date +%s)" --window background >/dev/null; }
+   ```
+   抽取的 eval 里不要固定 `sleep`：轮询等到页面上出现本人的帖子（切换后上一个账号的帖子会短暂留在页面上），再等 1 秒；整页重载时记 `window.__feedSeen = [h]`。`stale` 改为看 `location.pathname` 是否已切到目标账号；只有整页重载才同时检查 `performance.timeOrigin`。
 4. `feed_script(action="test", code=…)` 试跑，看报告里的 id、时间、标题是否合理；不对就改，直到 `status=ok`。
 5. `feed_script(action="save", name=…, url=…, code=…, note="这一版做了什么")`。保存会**再跑一次**，只有 `status=ok` 才保存为新版本并立即开始定时抓取（默认间隔同 RSS，可用 `interval_seconds` 调大，最少 300 秒）。
 
