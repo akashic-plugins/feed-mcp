@@ -2290,11 +2290,6 @@ def prepare_content_items(
                     "item_id": event_id,
                     "revision": revision,
                     "payload": frozen_payload,
-                    "not_before": str(
-                        frozen_payload.get("published_at")
-                        or frozen_payload["first_seen_at"]
-                    ),
-                    "requires_ack": True,
                 }
             )
         conn.commit()
@@ -2303,294 +2298,41 @@ def prepare_content_items(
         conn.close()
 
 
-def plan_content_backlog(*, data_root: Path) -> tuple[dict[str, str], ...]:
-    """Read the exact currently admissible Feed backlog without creating state."""
-
-    raw = _config_values()
-    cfg = FeedMcpConfig(
-        db_path=provider_database_path(data_root),
-        poll_ttl_seconds=max(60, int(raw["poll_ttl_seconds"])),
-        item_retention_hours=max(1, int(raw["item_retention_hours"])),
-        max_items_per_source=max(1, int(raw["max_items_per_source"])),
-        max_content_events=max(1, int(raw["max_content_events"])),
-        rank_mode=str(raw["rank_mode"]),
-        rank_impression_limit=max(1, int(raw["rank_impression_limit"])),
-        rank_model_learning_rate=max(0.001, float(raw["rank_model_learning_rate"])),
-    )
-    wal = cfg.db_path.with_name(cfg.db_path.name + "-wal")
-    if wal.is_file() and wal.stat().st_size > 0:
-        raise RuntimeError("Feed provider backlog plan requires a checkpoint")
-    uri = cfg.db_path.resolve().as_uri() + "?mode=ro&immutable=1"
-    conn = sqlite3.connect(uri, uri=True)
-    conn.row_factory = sqlite3.Row
+# 升级到直接交给值班时，旧流程里停在"未结算"的条目不再重交：一次性全部标记为已处理。
+def retire_content_backlog(*, data_root: Path, now: datetime | None = None) -> int:
+    cfg = load_config(data_root)
+    conn = _connect(cfg)
     try:
-        # 1. Reuse the production admission calculation over a frozen provider DB.
-        _ = conn.execute("PRAGMA query_only = ON")
-        now = _now()
-        rows = conn.execute(
+        # 1. 迁移标记存在就什么都不做，重启不会吞掉新条目。
+        done = conn.execute(
+            "SELECT 1 FROM metadata WHERE key = 'watch_emit_migrated'"
+        ).fetchone()
+        if done is not None:
+            return 0
+
+        # 2. 同一事务里把所有尚未结算的条目标记为已处理，并写下迁移标记。
+        stamp = now or _now()
+        cursor = conn.execute(
             """
-            SELECT
-                i.event_id, i.source_id, i.source_type, i.source_name,
-                i.title, i.content, i.url, i.author, i.published_at,
-                i.first_seen_at, i.content_hash
+            INSERT INTO acked_items (event_id, acked_at, expires_at)
+            SELECT i.event_id, ?, ?
             FROM items i
             LEFT JOIN acked_items a ON a.event_id = i.event_id
             WHERE a.event_id IS NULL
-            ORDER BY i.source_name ASC,
-                     i.published_at IS NULL ASC,
-                     i.published_at DESC,
-                     i.first_seen_at DESC
-            """
-        ).fetchall()
-        ranked = _rank_rows(conn, cfg, list(rows), now)
-        ranked_by_id = {
-            str(row["event_id"]): features for row, _score, features in ranked
-        }
-
-        # 2. Return only stable provider identities in deterministic order.
-        planned = [
-            {
-                "event_id": str(row["event_id"]),
-                "revision": str(row["content_hash"]),
-            }
-            for row in rows
-            if _content_admission_score(
-                ranked_by_id.get(str(row["event_id"]), {})
-            )
-            >= _CONTENT_ADMISSION_FLOOR
-        ]
-        return tuple(sorted(planned, key=lambda item: item["event_id"]))
-    finally:
-        conn.close()
-
-
-def supersede_content_backlog(
-    batch_id: str,
-    items: tuple[dict[str, str], ...],
-    *,
-    data_root: Path,
-) -> dict[str, object]:
-    """Atomically ACK one frozen pre-cutover backlog and retain its receipt."""
-
-    if not batch_id or not items:
-        raise ValueError("Feed cutover supersession requires a non-empty batch")
-    normalized = tuple(
-        sorted(
-            (
-                {"event_id": item["event_id"], "revision": item["revision"]}
-                for item in items
-            ),
-            key=lambda item: item["event_id"],
-        )
-    )
-    items_json = json.dumps(normalized, sort_keys=True, separators=(",", ":"))
-    items_digest = hashlib.sha256(items_json.encode()).hexdigest()
-    cfg = load_config(data_root)
-    conn = _connect(cfg)
-    now = _now()
-    try:
-        # 1. Resume only the same completed batch identity.
-        _ensure_legacy_backlog_receipts(conn)
-        existing = conn.execute(
-            "SELECT * FROM legacy_backlog_supersession_receipts WHERE batch_id = ?",
-            (batch_id,),
-        ).fetchone()
-        if existing is not None:
-            if (
-                str(existing["items_digest"]) != items_digest
-                or int(existing["item_count"]) != len(normalized)
-                or str(existing["items_json"]) != items_json
-            ):
-                raise RuntimeError("Feed cutover supersession batch conflict")
-            receipt = _legacy_backlog_receipt(existing)
-            if not _backlog_rows_are_acked(conn, normalized):
-                raise RuntimeError("Feed cutover supersession receipt is unverified")
-            return receipt
-
-        # 2. Lock and reverify every exact provider revision before ACK writes.
-        conn.commit()
-        conn.execute("BEGIN IMMEDIATE")
-        for item in normalized:
-            current = conn.execute(
-                "SELECT content_hash FROM items WHERE event_id = ?",
-                (item["event_id"],),
-            ).fetchone()
-            if current is None or str(current["content_hash"]) != item["revision"]:
-                raise RuntimeError(
-                    f"Feed cutover provider revision changed: {item['event_id']}"
-                )
-
-        # 3. ACK the complete set and commit its durable batch receipt atomically.
-        acked_at = now.isoformat()
-        expires_at = (now + timedelta(hours=cfg.item_retention_hours)).isoformat()
-        conn.executemany(
-            """
-            INSERT INTO acked_items(event_id, acked_at, expires_at)
-            VALUES (?, ?, ?)
-            ON CONFLICT(event_id) DO UPDATE SET
-                acked_at=excluded.acked_at,
-                expires_at=excluded.expires_at
             """,
             (
-                (item["event_id"], acked_at, expires_at)
-                for item in normalized
+                stamp.isoformat(),
+                (stamp + timedelta(hours=cfg.item_retention_hours)).isoformat(),
             ),
         )
-        receipt_id = f"feed-cutover:{items_digest}"
         conn.execute(
-            """
-            INSERT INTO legacy_backlog_supersession_receipts(
-                batch_id, receipt_id, items_digest, item_count,
-                items_json, committed_at
-            ) VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (
-                batch_id,
-                receipt_id,
-                items_digest,
-                len(normalized),
-                items_json,
-                now.isoformat(),
-            ),
+            "INSERT INTO metadata(key, value) VALUES('watch_emit_migrated', ?)",
+            (stamp.isoformat(),),
         )
         conn.commit()
-        row = conn.execute(
-            "SELECT * FROM legacy_backlog_supersession_receipts WHERE batch_id = ?",
-            (batch_id,),
-        ).fetchone()
-        if row is None:
-            raise RuntimeError("Feed cutover supersession receipt commit missing")
-        return _legacy_backlog_receipt(row)
+        return cursor.rowcount
     finally:
         conn.close()
-
-
-def verify_content_backlog_supersession(
-    batch_id: str,
-    items: tuple[dict[str, str], ...],
-    *,
-    data_root: Path,
-) -> bool:
-    """Verify the exact batch receipt and every provider suppression row read-only."""
-
-    path = provider_database_path(data_root)
-    wal = path.with_name(path.name + "-wal")
-    if wal.is_file() and wal.stat().st_size > 0:
-        return False
-    uri = path.resolve().as_uri() + "?mode=ro&immutable=1"
-    conn = sqlite3.connect(uri, uri=True)
-    conn.row_factory = sqlite3.Row
-    try:
-        _ = conn.execute("PRAGMA query_only = ON")
-        table = conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' "
-            "AND name='legacy_backlog_supersession_receipts'"
-        ).fetchone()
-        if table is None:
-            return False
-        row = conn.execute(
-            "SELECT * FROM legacy_backlog_supersession_receipts WHERE batch_id = ?",
-            (batch_id,),
-        ).fetchone()
-        if row is None:
-            return False
-        normalized = tuple(sorted(items, key=lambda item: item["event_id"]))
-        items_json = json.dumps(normalized, sort_keys=True, separators=(",", ":"))
-        if (
-            str(row["items_json"]) != items_json
-            or str(row["items_digest"])
-            != hashlib.sha256(items_json.encode()).hexdigest()
-            or int(row["item_count"]) != len(normalized)
-        ):
-            return False
-        return _backlog_rows_are_acked(conn, normalized)
-    finally:
-        conn.close()
-
-
-def read_content_backlog_supersession(
-    batch_id: str,
-    *,
-    data_root: Path,
-) -> tuple[dict[str, object], tuple[dict[str, str], ...]] | None:
-    """Read one completed cutover batch and its exact item identities."""
-
-    path = provider_database_path(data_root)
-    wal = path.with_name(path.name + "-wal")
-    if wal.is_file() and wal.stat().st_size > 0:
-        raise RuntimeError("Feed cutover receipt read requires a checkpoint")
-    uri = path.resolve().as_uri() + "?mode=ro&immutable=1"
-    conn = sqlite3.connect(uri, uri=True)
-    conn.row_factory = sqlite3.Row
-    try:
-        _ = conn.execute("PRAGMA query_only = ON")
-        table = conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' "
-            "AND name='legacy_backlog_supersession_receipts'"
-        ).fetchone()
-        if table is None:
-            return None
-        row = conn.execute(
-            "SELECT * FROM legacy_backlog_supersession_receipts WHERE batch_id = ?",
-            (batch_id,),
-        ).fetchone()
-        if row is None:
-            return None
-        decoded = json.loads(str(row["items_json"]))
-        if not isinstance(decoded, list):
-            raise RuntimeError("Feed cutover receipt items must be a list")
-        parsed: list[dict[str, str]] = []
-        for item in decoded:
-            if not isinstance(item, dict):
-                raise RuntimeError("Feed cutover receipt item must be an object")
-            event_id = item.get("event_id")
-            revision = item.get("revision")
-            if not isinstance(event_id, str) or not isinstance(revision, str):
-                raise RuntimeError("Feed cutover receipt item identity is invalid")
-            parsed.append({"event_id": event_id, "revision": revision})
-        return _legacy_backlog_receipt(row), tuple(parsed)
-    finally:
-        conn.close()
-
-
-def _ensure_legacy_backlog_receipts(conn: sqlite3.Connection) -> None:
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS legacy_backlog_supersession_receipts(
-            batch_id TEXT PRIMARY KEY,
-            receipt_id TEXT NOT NULL UNIQUE,
-            items_digest TEXT NOT NULL,
-            item_count INTEGER NOT NULL,
-            items_json TEXT NOT NULL,
-            committed_at TEXT NOT NULL
-        )
-        """
-    )
-
-
-def _legacy_backlog_receipt(row: sqlite3.Row) -> dict[str, object]:
-    return {
-        "batch_id": str(row["batch_id"]),
-        "receipt_id": str(row["receipt_id"]),
-        "items_digest": str(row["items_digest"]),
-        "item_count": int(row["item_count"]),
-        "committed_at": str(row["committed_at"]),
-    }
-
-
-def _backlog_rows_are_acked(
-    conn: sqlite3.Connection,
-    items: tuple[dict[str, str], ...],
-) -> bool:
-    return all(
-        conn.execute(
-            "SELECT 1 FROM acked_items a JOIN items i USING(event_id) "
-            "WHERE a.event_id = ? AND i.content_hash = ?",
-            (item["event_id"], item["revision"]),
-        ).fetchone()
-        is not None
-        for item in items
-    )
 
 
 def settle_content_item(
@@ -2630,165 +2372,6 @@ def settle_content_item(
         return {"status": "committed", "disposition": "acknowledged"}
     finally:
         conn.close()
-
-
-def settle_legacy_ack(
-    event_id: str,
-    revision: str,
-    action: str,
-    source_digest: str,
-    *,
-    data_root: Path,
-) -> dict[str, str]:
-    """Commit one legacy Wake ACK and retain its target-owned receipt."""
-
-    cfg = load_config(data_root)
-    conn = _connect(cfg)
-    now = _now()
-    receipt_id = f"feed-legacy-ack:{source_digest}"
-    try:
-        # 1. Reuse a completed handoff without extending the provider ACK.
-        _ensure_legacy_ack_receipts(conn)
-        existing = conn.execute(
-            "SELECT * FROM legacy_ack_handoff_receipts WHERE receipt_id = ?",
-            (receipt_id,),
-        ).fetchone()
-        if existing is not None:
-            identity = tuple(
-                str(existing[field])
-                for field in ("source_digest", "event_id", "revision", "action")
-            )
-            if identity != (source_digest, event_id, revision, action):
-                raise RuntimeError("Feed legacy ACK receipt identity conflict")
-            return _legacy_ack_receipt(existing)
-
-        # 2. Commit one exact provider ACK and its durable receipt atomically.
-        acked_at, expires_at = _commit_legacy_provider_ack(
-            conn, cfg, event_id, revision, now
-        )
-        _insert_legacy_ack_receipt(
-            conn,
-            receipt_id,
-            source_digest,
-            event_id,
-            revision,
-            action,
-            acked_at,
-            expires_at,
-            now,
-        )
-        conn.commit()
-        row = conn.execute(
-            "SELECT * FROM legacy_ack_handoff_receipts WHERE receipt_id = ?",
-            (receipt_id,),
-        ).fetchone()
-        if row is None:
-            raise RuntimeError("Feed legacy ACK receipt commit missing")
-        return _legacy_ack_receipt(row)
-    finally:
-        conn.close()
-
-
-def _ensure_legacy_ack_receipts(conn: sqlite3.Connection) -> None:
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS legacy_ack_handoff_receipts(
-            receipt_id TEXT PRIMARY KEY,
-            source_digest TEXT NOT NULL UNIQUE,
-            event_id TEXT NOT NULL,
-            revision TEXT NOT NULL,
-            action TEXT NOT NULL,
-            acked_at TEXT NOT NULL,
-            expires_at TEXT NOT NULL,
-            committed_at TEXT NOT NULL
-        )
-        """
-    )
-
-
-def _commit_legacy_provider_ack(
-    conn: sqlite3.Connection,
-    cfg: FeedMcpConfig,
-    event_id: str,
-    revision: str,
-    now: datetime,
-) -> tuple[str, str]:
-    """Preserve a live provider ACK or establish one new retention window."""
-
-    current = conn.execute(
-        "SELECT content_hash FROM items WHERE event_id = ?", (event_id,)
-    ).fetchone()
-    if current is None:
-        raise RuntimeError(f"Feed legacy ACK provider item missing: {event_id}")
-    if str(current["content_hash"]) != revision:
-        raise RuntimeError(f"Feed legacy ACK revision changed: {event_id}")
-    acknowledgement = conn.execute(
-        "SELECT acked_at, expires_at FROM acked_items WHERE event_id = ?",
-        (event_id,),
-    ).fetchone()
-    if acknowledgement is not None and datetime.fromisoformat(
-        str(acknowledgement["expires_at"])
-    ) > now:
-        return str(acknowledgement["acked_at"]), str(acknowledgement["expires_at"])
-    acked_at = now.isoformat()
-    expires_at = (now + timedelta(hours=cfg.item_retention_hours)).isoformat()
-    conn.execute(
-        """
-        INSERT INTO acked_items(event_id, acked_at, expires_at)
-        VALUES (?, ?, ?)
-        ON CONFLICT(event_id) DO UPDATE SET
-            acked_at=excluded.acked_at,
-            expires_at=excluded.expires_at
-        """,
-        (event_id, acked_at, expires_at),
-    )
-    return acked_at, expires_at
-
-
-def _insert_legacy_ack_receipt(
-    conn: sqlite3.Connection,
-    receipt_id: str,
-    source_digest: str,
-    event_id: str,
-    revision: str,
-    action: str,
-    acked_at: str,
-    expires_at: str,
-    now: datetime,
-) -> None:
-    conn.execute(
-        """
-        INSERT INTO legacy_ack_handoff_receipts(
-            receipt_id, source_digest, event_id, revision, action,
-            acked_at, expires_at, committed_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            receipt_id,
-            source_digest,
-            event_id,
-            revision,
-            action,
-            acked_at,
-            expires_at,
-            now.isoformat(),
-        ),
-    )
-
-
-def _legacy_ack_receipt(row: sqlite3.Row) -> dict[str, str]:
-    return {
-        field: str(row[field])
-        for field in (
-            "receipt_id",
-            "source_digest",
-            "event_id",
-            "revision",
-            "action",
-            "acked_at",
-            "expires_at",
-        )
-    }
 
 
 def content_source_deadline(*, data_root: Path, now: datetime) -> datetime:

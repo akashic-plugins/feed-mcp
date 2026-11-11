@@ -2,14 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
-from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import cast
 
 import pytest
 
 from plugins.timer.contract import TimerReceipt, TimerStatus
+from feed_test_plugin import content_source  # pyright: ignore[reportMissingImports]
 from feed_test_plugin.content_source import FeedContentRuntime  # pyright: ignore[reportMissingImports]
 from feed_test_plugin.feed_runtime import backend  # pyright: ignore[reportMissingImports]
 
@@ -52,35 +51,29 @@ class _Timer:
         return handle
 
 
-class _Content:
+class _Watch:
     def __init__(self) -> None:
-        self.submissions: list[tuple[str, tuple[dict[str, object], ...]]] = []
-        self.rows: list[dict[str, object]] = []
-        self.fail_ack_once = False
-        self.ack_receipt: dict[str, object] = {
-            "settled": True,
-            "duplicate": False,
-        }
+        self.events: list[dict[str, object]] = []
+        self.fail_once = False
 
-    async def submit(self, batch_id, items):
-        frozen = tuple(dict(item) for item in items)
-        self.submissions.append((batch_id, frozen))
-        return {"inserted": [item["item_id"] for item in frozen]}
-
-    async def unsettled(self, limit=100):
-        return tuple(self.rows[:limit])
-
-    async def ack(self, settlement_ref):
-        if self.fail_ack_once:
-            self.fail_ack_once = False
-            raise RuntimeError("crash after provider ACK")
-        if self.ack_receipt.get("settled") is True:
-            self.rows = [
-                row
-                for row in self.rows
-                if row["settlement_ref"] != settlement_ref
-            ]
-        return dict(self.ack_receipt)
+    async def emit(
+        self,
+        source: str,
+        *,
+        title: str = "",
+        text: str = "",
+        url: str = "",
+        at: datetime | None = None,
+        state: bool = False,
+        key: str = "",
+    ) -> str:
+        if self.fail_once:
+            self.fail_once = False
+            raise RuntimeError("watch unavailable")
+        self.events.append(
+            {"source": source, "title": title, "text": text, "url": url, "at": at, "state": state, "key": key}
+        )
+        return f"event:{len(self.events)}"
 
 
 def _seed_item(data_root: Path, now: datetime) -> None:
@@ -103,132 +96,103 @@ def _seed_item(data_root: Path, now: datetime) -> None:
         connection.close()
 
 
+def _acked(data_root: Path) -> list[str]:
+    with sqlite3.connect(data_root / "feed_mcp.sqlite3") as connection:
+        rows = connection.execute("SELECT event_id FROM acked_items").fetchall()
+    return [str(row[0]) for row in rows]
+
+
+async def _wait_handles(timer: _Timer, count: int) -> None:
+    for _ in range(300):
+        if len(timer.handles) == count:
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError("timer did not rearm")
+
+
 @pytest.mark.asyncio
-async def test_timer_poll_submits_nonempty_once_and_empty_poll_has_no_history(
+async def test_poll_emits_each_item_and_settles_immediately(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     now = datetime(2026, 8, 23, 10, tzinfo=UTC)
     monkeypatch.setattr(backend, "_now", lambda: now)
     timer = _Timer(now)
-    content = _Content()
-    _seed_item(tmp_path, now)
-    runtime = FeedContentRuntime(
-        tmp_path,
-        timer,
-        content,
-        now=lambda: now,
-    )
-
+    watch = _Watch()
+    # 迁移在 start 里完成；之后才出现的条目必须被交出去。
+    runtime = FeedContentRuntime(tmp_path, timer, watch, now=lambda: now)
     await runtime.start()
-    assert len(timer.handles) == 1
-    handler = runtime._log_handler  # pyright: ignore[reportPrivateUsage]
-    assert handler is not None
-    assert handler.backupCount == 3
-    assert handler.maxBytes == 5 * 1024 * 1024
+    _seed_item(tmp_path, now)
     timer.handles[0].fire()
-    for _ in range(200):
-        if content.submissions and len(timer.handles) == 2:
-            break
-        await asyncio.sleep(0.01)
-    assert len(content.submissions) == 1
-    payload = cast(Mapping[str, object], content.submissions[0][1][0]["payload"])
-    assert payload["content"] == "Body"
+    await _wait_handles(timer, 2)
 
-    # ACK the only item, then the next empty poll only updates current deadline.
-    _ = backend.settle_content_item(
-        "event-1", "revision-1", data_root=tmp_path
-    )
+    assert watch.events == [
+        {
+            "source": "Source",
+            "title": "Title",
+            "text": "Body",
+            "url": "https://example.com/1",
+            "at": now,
+            "state": False,
+            "key": "event-1:revision-1",
+        }
+    ]
+    assert _acked(tmp_path) == ["event-1"]
+
+    # 已结算的条目不会再交，空轮询只更新 deadline。
     timer.handles[1].fire()
-    for _ in range(200):
-        if len(timer.handles) == 3:
-            break
-        await asyncio.sleep(0.01)
-    assert len(content.submissions) == 1
-    with sqlite3.connect(tmp_path / "feed_mcp.sqlite3") as connection:
-        assert connection.execute(
-            "SELECT COUNT(*) FROM content_exports"
-        ).fetchone() == (1,)
-        assert connection.execute(
-            "SELECT COUNT(*) FROM metadata WHERE key='content_source_next_due'"
-        ).fetchone() == (1,)
+    await _wait_handles(timer, 3)
+    assert len(watch.events) == 1
     await runtime.close()
 
 
 @pytest.mark.asyncio
-async def test_provider_ack_retries_after_crash_before_content_ack(
+async def test_failed_emit_leaves_item_unsettled_and_retries_with_same_key(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     now = datetime(2026, 8, 23, 10, tzinfo=UTC)
+    monkeypatch.setattr(backend, "_now", lambda: now)
+    watch = _Watch()
+    runtime = FeedContentRuntime(tmp_path, _Timer(now), watch, now=lambda: now)
+    _ = backend.retire_content_backlog(data_root=tmp_path, now=now)
     _seed_item(tmp_path, now)
-    content = _Content()
-    content.rows = [
-        {
-            "ref": {"item_id": "event-1", "revision": "revision-1"},
-            "settlement_ref": "delivery:1",
-        }
-    ]
-    content.fail_ack_once = True
-    runtime = FeedContentRuntime(
-        tmp_path,
-        _Timer(now),
-        content,
-        now=lambda: now,
-    )
+    items = await _prepare(tmp_path, now)
 
-    with pytest.raises(RuntimeError, match="crash after provider ACK"):
-        await runtime._settle_delivered()  # pyright: ignore[reportPrivateUsage]
-    assert content.rows
-    assert await runtime._settle_delivered() == 1  # pyright: ignore[reportPrivateUsage]
-    assert content.rows == []
-    with sqlite3.connect(tmp_path / "feed_mcp.sqlite3") as connection:
-        assert connection.execute(
-            "SELECT event_id FROM acked_items"
-        ).fetchall() == [("event-1",)]
+    watch.fail_once = True
+    with pytest.raises(RuntimeError, match="watch unavailable"):
+        _ = await runtime._emit_items(items)  # pyright: ignore[reportPrivateUsage]
+    assert _acked(tmp_path) == []
+
+    assert await runtime._emit_items(items) == 1  # pyright: ignore[reportPrivateUsage]
+    assert [event["key"] for event in watch.events] == ["event-1:revision-1"]
+    assert _acked(tmp_path) == ["event-1"]
 
 
 @pytest.mark.asyncio
-async def test_duplicate_content_ack_is_already_settled(tmp_path: Path) -> None:
+async def test_first_start_retires_old_backlog_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     now = datetime(2026, 8, 23, 10, tzinfo=UTC)
+    monkeypatch.setattr(backend, "_now", lambda: now)
+    timer = _Timer(now)
+    watch = _Watch()
     _seed_item(tmp_path, now)
-    content = _Content()
-    content.rows = [
-        {
-            "ref": {"item_id": "event-1", "revision": "revision-1"},
-            "settlement_ref": "delivery:1",
-        }
-    ]
-    content.ack_receipt = {"settled": True, "duplicate": True}
-    runtime = FeedContentRuntime(
-        tmp_path,
-        _Timer(now),
-        content,
-        now=lambda: now,
+    runtime = FeedContentRuntime(tmp_path, timer, watch, now=lambda: now)
+
+    await runtime.start()
+    assert _acked(tmp_path) == ["event-1"]
+    timer.handles[0].fire()
+    await _wait_handles(timer, 2)
+    assert watch.events == []
+    await runtime.close()
+
+    # 标记已写入：再次启动不会把之后新到的条目吞掉。
+    assert backend.retire_content_backlog(data_root=tmp_path, now=now) == 0
+
+
+async def _prepare(data_root: Path, now: datetime) -> tuple[dict[str, object], ...]:
+    return await content_source._prepare_content_items(  # pyright: ignore[reportPrivateUsage]
+        data_root, now
     )
-
-    assert await runtime._settle_delivered() == 1  # pyright: ignore[reportPrivateUsage]
-    assert content.rows == []
-
-
-@pytest.mark.asyncio
-async def test_unsettled_content_ack_fails_loud(tmp_path: Path) -> None:
-    now = datetime(2026, 8, 23, 10, tzinfo=UTC)
-    _seed_item(tmp_path, now)
-    content = _Content()
-    content.rows = [
-        {
-            "ref": {"item_id": "event-1", "revision": "revision-1"},
-            "settlement_ref": "delivery:1",
-        }
-    ]
-    content.ack_receipt = {"settled": False, "reason": "state_mismatch"}
-    runtime = FeedContentRuntime(
-        tmp_path,
-        _Timer(now),
-        content,
-        now=lambda: now,
-    )
-
-    with pytest.raises(RuntimeError, match="Feed Content ACK 未提交"):
-        await runtime._settle_delivered()  # pyright: ignore[reportPrivateUsage]
-    assert content.rows

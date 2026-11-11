@@ -23,7 +23,6 @@ from plugins.ledger.log import MessageLog
 from agent.plugins.manager import PluginManager
 from agent.plugins.python_environment import ENVIRONMENT_FILE, PythonEnvironments
 from agent.plugins.static_manifest import load_static_plugin_manifest
-from plugins.eventmail.store import EventMailStore
 
 from feed_runtime import backend
 
@@ -92,14 +91,55 @@ async def _eventually(predicate) -> None:
     raise AssertionError("condition did not settle")
 
 
+_WATCH_STUB = """
+import json
+
+from plugins.watch.contract import WATCH_EVENTS
+
+api_version = 3
+name = "watch"
+version = "0.0.0"
+desc = "测试用值班事件入口：把 emit 记成 JSON 行"
+
+
+class Sink:
+    def __init__(self, path):
+        self._path = path
+
+    async def emit(self, source, *, title="", text="", url="", at=None, state=False, key=""):
+        with self._path.open("a", encoding="utf-8") as handle:
+            row = {"source": source, "title": title, "text": text, "url": url, "key": key}
+            handle.write(json.dumps(row, ensure_ascii=False) + "\\n")
+        return key
+
+
+async def apply(ctx):
+    await ctx.provide(WATCH_EVENTS, Sink(ctx.data_root / "emitted.jsonl"))
+"""
+
+
+# 在临时目录写一个只记录 emit 的值班入口，Feed 的其余依赖仍用真实插件。
+def _write_watch_stub(plugins: Path) -> Path:
+    watch = plugins / "watch"
+    watch.mkdir(parents=True)
+    (watch / "plugin.py").write_text(_WATCH_STUB, encoding="utf-8")
+    return watch
+
+
+def _emitted(workspace: Path) -> list[dict[str, str]]:
+    path = workspace / "plugin-data" / "watch-builtin" / "emitted.jsonl"
+    if not path.is_file():
+        return []
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+
 def _stage_plugins(tmp_path: Path) -> tuple[Path, Path]:
-    """将真实 Content、Feed 插件装入临时测试环境。"""
+    """将值班入口替身与 Feed 插件装入临时测试环境。"""
 
     runtime = _fixture_runtime()
     plugins = tmp_path / "plugins"
-    content = plugins / "eventmail"
+    content = _write_watch_stub(plugins)
     feed = plugins / "feed"
-    shutil.copytree(CORE_ROOT / "plugins" / "eventmail", content)
     shutil.copytree(
         ROOT,
         feed,
@@ -119,13 +159,12 @@ def _stage_plugins(tmp_path: Path) -> tuple[Path, Path]:
 
 
 def _stage_legacy_plugins(tmp_path: Path) -> tuple[Path, Path]:
-    """装入 Content 和旧 lifespan Feed owner fixture。"""
+    """装入值班入口替身和旧 lifespan Feed owner fixture。"""
 
     runtime = _fixture_runtime()
     plugins = tmp_path / "plugins"
-    content = plugins / "eventmail"
+    content = _write_watch_stub(plugins)
     feed = plugins / "feed"
-    shutil.copytree(CORE_ROOT / "plugins" / "eventmail", content)
     shutil.copytree(ROOT / "tests" / "fixtures" / "legacy_feed_owner", feed)
     (feed / "mcp" / ".venv").symlink_to(runtime, target_is_directory=True)
     return content, feed
@@ -257,7 +296,6 @@ async def test_manager_real_tool_and_timer_handoff(
         root = manager.live_root
         old = manager.generation("feed")
         assert root is not None and old is not None and old.fiber is not None
-        await manager.start_runtime()
         await _eventually(lambda: sum(len(timer.handles) for timer in timers) == 1)
         formal_timer = next(timer for timer in timers if timer.handles)
 
@@ -273,10 +311,17 @@ async def test_manager_real_tool_and_timer_handoff(
         feed_data = workspace / "plugin-data" / "feed-builtin"
         _seed_item(feed_data, now)
         formal_timer.handles[0].fire()
-        content_path = workspace / "plugin-data" / "eventmail-builtin" / "eventmail.sqlite3"
-        content_store = EventMailStore(content_path)
-        await _eventually(lambda: content_store.state_counts().get("pending") == 1)
+        await _eventually(lambda: len(_emitted(workspace)) == 1)
         await _eventually(lambda: len(formal_timer.handles) == 2)
+        assert _emitted(workspace) == [
+            {
+                "source": "Source",
+                "title": "Title",
+                "text": "Body",
+                "url": "https://example.com/1",
+                "key": "event-1:revision-1",
+            }
+        ]
         with sqlite3.connect(feed_data / "feed_mcp.sqlite3") as connection:
             assert connection.execute("PRAGMA integrity_check").fetchone() == ("ok",)
             payload = connection.execute("SELECT payload_json FROM content_exports").fetchone()[0]
@@ -292,7 +337,7 @@ async def test_manager_real_tool_and_timer_handoff(
         assert manager.live_root is root
         await _eventually(lambda: len(formal_timer.handles) == 3)
         assert (await formal_timer.handles[1].result()).status is TimerStatus.CANCELLED
-        assert content_store.state_counts() == {"pending": 1}
+        assert len(_emitted(workspace)) == 1
         active = [
             handle
             for timer in timers
@@ -349,7 +394,6 @@ async def test_legacy_mcp_owner_drains_before_new_timer_starts(
         old = manager.generation("feed")
         assert root is not None and old is not None and old.fiber is not None
         old_fiber = old.fiber
-        await manager.start_runtime()
         owner_log = workspace / "plugin-data" / "feed-builtin" / "legacy-owner.jsonl"
         servers = root.context.require(MCP_SERVERS)
 

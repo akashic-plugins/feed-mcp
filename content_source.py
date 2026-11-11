@@ -1,43 +1,41 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import logging
 import sys
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping
 from datetime import UTC, datetime, timedelta
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import cast
 
 from plugins.timer.contract import OneShotTimer, TimerHandle, TimerStatus
+from plugins.watch.contract import WatchEvents
 
 from .feed_runtime import CONTENT_SOURCE_ID, backend, scripts
 from .feed_runtime.events import ScriptOutcome, failed
 from .feed_runtime.scripts import ScriptSource
 
 
-from plugins.eventmail.contract import BoundContentSource
-
 ScriptExecutor = Callable[[ScriptSource], Awaitable[ScriptOutcome]]
 
 
 class FeedContentRuntime:
-    """轮询 Feed、提交精确 revision，并收束 provider ACK。"""
+    """轮询 Feed，把新条目逐条交给值班，交付成功即在 Feed 里结算。"""
 
     def __init__(
         self,
         data_root: Path,
         timers: OneShotTimer,
-        content: BoundContentSource,
+        watch: WatchEvents,
         *,
         now: Callable[[], datetime] | None = None,
         run_script: ScriptExecutor | None = None,
     ) -> None:
         self._data_root = data_root
         self._timers = timers
-        self._content = content
+        self._watch = watch
         self._run_script = run_script
         self._now = now or (lambda: datetime.now(UTC))
         self._handle: TimerHandle | None = None
@@ -55,6 +53,14 @@ class FeedContentRuntime:
         if self._handle is not None:
             return
         self._start_diagnostics()
+        # 升级后第一次启动：旧流程积压的"未结算"条目直接标记为已处理，不重交。
+        retired = await asyncio.to_thread(
+            backend.retire_content_backlog,
+            data_root=self._data_root,
+            now=self._aware_now(),
+        )
+        if retired:
+            self._log.info("retired legacy backlog items=%d", retired)
         deadline = await asyncio.to_thread(
             backend.content_source_deadline,
             data_root=self._data_root,
@@ -99,10 +105,7 @@ class FeedContentRuntime:
             if receipt.status is TimerStatus.CANCELLED or self._closed:
                 return
 
-            # 1. 先完成 provider ACK，再获取下一份待处理快照。
-            settled = await self._settle_delivered()
-
-            # 2. 由唯一外部轮询 owner 刷新持久 Feed 缓存。
+            # 1. 由唯一外部轮询 owner 刷新持久 Feed 缓存。
             await asyncio.to_thread(
                 backend.poll_feeds_only, data_root=self._data_root
             )
@@ -111,14 +114,10 @@ class FeedContentRuntime:
                 self._data_root, self._aware_now()
             )
 
-            # 3. 非空 Content 提交成功后才能推进 source deadline。
-            submitted = 0
-            if items:
-                result = await self._content.submit(_batch_id(items), items)
-                inserted = result["inserted"]
-                if not isinstance(inserted, list):
-                    raise TypeError("Feed Content submit receipt inserted 必须是 list")
-                submitted = len(inserted)
+            # 2. 逐条交给值班，交付成功立刻结算；失败则下一轮用同一个 key 重试。
+            emitted = await self._emit_items(items)
+
+            # 3. 全部交付成功后才能推进 source deadline。
             config = await asyncio.to_thread(
                 backend.load_config, self._data_root
             )
@@ -131,10 +130,9 @@ class FeedContentRuntime:
                 deadline=next_due,
             )
             self._log.info(
-                "poll committed items=%d inserted=%d settled=%d scripts=%d next_due=%s",
+                "poll committed items=%d emitted=%d scripts=%d next_due=%s",
                 len(items),
-                submitted,
-                settled,
+                emitted,
                 polled_scripts,
                 next_due.isoformat(),
             )
@@ -176,31 +174,34 @@ class FeedContentRuntime:
             )
         return len(due)
 
-    async def _settle_delivered(self) -> int:
-        """用精确 Feed revision 收束每条已投递 Content receipt。"""
-
-        settled = 0
-        while rows := await self._content.unsettled(100):
-            for row in rows:
-                ref = _mapping(row["ref"], "Feed unsettled ref")
-                result = await asyncio.to_thread(
-                    backend.settle_content_item,
-                    _string(ref["item_id"], "Feed item_id"),
-                    _string(ref["revision"], "Feed revision"),
-                    data_root=self._data_root,
+    # 把每条 Feed 条目作为一次 emit 交给值班，并在成功后立刻结算。
+    async def _emit_items(self, items: tuple[dict[str, object], ...]) -> int:
+        emitted = 0
+        for item in items:
+            item_id = _string(item["item_id"], "Feed item_id")
+            revision = _string(item["revision"], "Feed revision")
+            payload = _mapping(item["payload"], "Feed payload")
+            title = _text(payload, "title")
+            text = _text(payload, "content")
+            url = _text(payload, "url")
+            # 标题、正文、链接都空的条目没有可交的内容，直接结算掉避免每轮重试。
+            if title or text or url:
+                _ = await self._watch.emit(
+                    _text(payload, "source_name") or CONTENT_SOURCE_ID,
+                    title=title or ("" if text else url),
+                    text=text,
+                    url=url,
+                    at=_event_time(payload),
+                    key=f"{item_id}:{revision}",
                 )
-                if result.get("status") != "committed" or result.get(
-                    "disposition"
-                ) not in {"acknowledged", "obsolete_revision", "not_pending"}:
-                    raise RuntimeError(f"Feed provider ACK 未提交: {result!r}")
-                settlement_ref = _string(
-                    row["settlement_ref"], "Feed settlement_ref"
-                )
-                receipt = await self._content.ack(settlement_ref)
-                if receipt.get("settled") is not True:
-                    raise RuntimeError(f"Feed Content ACK 未提交: {receipt!r}")
-                settled += 1
-        return settled
+                emitted += 1
+            _ = await asyncio.to_thread(
+                backend.settle_content_item,
+                item_id,
+                revision,
+                data_root=self._data_root,
+            )
+        return emitted
 
     def _aware_now(self) -> datetime:
         value = self._now()
@@ -292,18 +293,23 @@ def _prepared_items(value: object) -> tuple[dict[str, object], ...]:
     )
 
 
-def _batch_id(items: Sequence[Mapping[str, object]]) -> str:
-    identities = [
-        {
-            "item_id": _string(item["item_id"], "Feed item_id"),
-            "revision": _string(item["revision"], "Feed revision"),
-        }
-        for item in items
-    ]
-    encoded = json.dumps(
-        identities, sort_keys=True, separators=(",", ":")
-    ).encode("utf-8")
-    return f"feed-content:{hashlib.sha256(encoded).hexdigest()}"
+def _text(payload: Mapping[str, object], field: str) -> str:
+    value = payload.get(field)
+    return value.strip() if isinstance(value, str) else ""
+
+
+# 条目的发生时间：优先发布时间，缺失或无法解析时用首次看到的时间。
+def _event_time(payload: Mapping[str, object]) -> datetime | None:
+    for field in ("published_at", "first_seen_at"):
+        raw = _text(payload, field)
+        if not raw:
+            continue
+        try:
+            value = datetime.fromisoformat(raw)
+        except ValueError:
+            continue
+        return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+    return None
 
 
 def _mapping(value: object, label: str) -> Mapping[str, object]:
