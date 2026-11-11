@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+from datetime import datetime
 from pathlib import Path
 from typing import cast
 
@@ -17,10 +18,7 @@ from plugins.timer.contract import TIMERS
 from agent.plugin_composition.tasks import TASKS, PluginTasks
 from agent.plugins.composable import ComposablePlugin
 from agent.plugins.static_manifest import load_static_plugin_manifest
-from plugins.eventmail.contract import (
-    BoundContentSource,
-    ContentSourceServices,
-)
+from plugins.watch.contract import WATCH_EVENTS
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -54,31 +52,19 @@ async def _mount_tools(
     return tasks, fiber
 
 
-class _Content:
-    def __init__(self) -> None:
-        self.closed = 0
-
-    def close(self) -> None:
-        self.closed += 1
-
-    async def submit(self, batch_id, items):
-        raise AssertionError((batch_id, items))
-
-    async def unsettled(self, limit=100):
-        raise AssertionError(limit)
-
-    async def ack(self, settlement_ref):
-        raise AssertionError(settlement_ref)
-
-
-class _Sources:
-    def __init__(self) -> None:
-        self.bound: list[str] = []
-        self.content = _Content()
-
-    def bind(self, source_id: str) -> BoundContentSource:
-        self.bound.append(source_id)
-        return cast(BoundContentSource, self.content)
+class _Watch:
+    async def emit(
+        self,
+        source: str,
+        *,
+        title: str = "",
+        text: str = "",
+        url: str = "",
+        at: datetime | None = None,
+        state: bool = False,
+        key: str = "",
+    ) -> str:
+        raise AssertionError((source, title, text, url, at, state, key))
 
 
 async def _never_sleep(_seconds: float) -> None:
@@ -90,22 +76,21 @@ async def _never_sleep(_seconds: float) -> None:
 def test_pure_v3_exports_and_exact_apply() -> None:
     assert plugin.api_version == 3
     assert plugin.name == "feed"
-    assert plugin.version == "3.3.1"
+    assert plugin.version == "3.4.0"
     assert plugin.skill_roots == ("skills",)
     assert tuple(inspect.signature(plugin.apply).parameters) == ("ctx",)
 
 
 @pytest.mark.asyncio
-async def test_apply_registers_native_tools_and_dormant_content_runtime(
+async def test_apply_registers_native_tools_and_dormant_watch_runtime(
     tmp_path: Path,
 ) -> None:
     root = CompositionRoot("feed:test")
-    sources = _Sources()
     await root.context.provide(
         TIMERS,
         AsyncioOneShotTimer(),
     )
-    await root.context.provide(plugin.EVENTMAIL_CONTENT_SOURCE, sources)
+    await root.context.provide(WATCH_EVENTS, _Watch())
     data_dir = tmp_path / "plugin-data"
     tasks, tools_fiber = await _mount_tools(root, tmp_path)
     try:
@@ -126,24 +111,22 @@ async def test_apply_registers_native_tools_and_dormant_content_runtime(
             ),
         )
 
-        assert sources.bound == ["feed-subscriptions"]
         assert data_dir.is_dir()
         topology = root.topology_view()
         assert topology.listeners == (
-            "serial:runtime.started:feed/feed-eventmail-source",
-            "serial:runtime.stopping:feed/feed-eventmail-source",
+            "serial:runtime.started:feed/feed-watch-source",
+            "serial:runtime.stopping:feed/feed-watch-source",
         )
         assert [ref.name for ref in root.context.require(FEED_TOOLS).refs] == ["feed_manage", "feed_query"]
     finally:
         await tasks.close()
         await tools_fiber.dispose()
         await root.dispose()
-    assert sources.content.closed == 1
 
 
 @pytest.mark.asyncio
-async def test_apply_keeps_native_tools_without_eventmail(tmp_path: Path) -> None:
-    root = CompositionRoot("feed:without-eventmail")
+async def test_apply_keeps_native_tools_without_watch(tmp_path: Path) -> None:
+    root = CompositionRoot("feed:without-watch")
     await root.context.provide(TIMERS, AsyncioOneShotTimer())
     tasks, tools_fiber = await _mount_tools(root, tmp_path)
     try:
@@ -156,7 +139,7 @@ async def test_apply_keeps_native_tools_without_eventmail(tmp_path: Path) -> Non
             inject=composable.inject,
             runtime=PluginRuntime(
                 plugin_id="feed",
-                generation_id="feed:without-eventmail",
+                generation_id="feed:without-watch",
                 plugin_dir=ROOT,
                 data_dir=tmp_path / "plugin-data",
                 workspace=tmp_path / "workspace",
@@ -175,7 +158,7 @@ def test_static_manifest_reads_identity_and_runtime_requirements() -> None:
     manifest = load_static_plugin_manifest(ROOT)
 
     assert manifest.name == "feed"
-    assert manifest.version == plugin.version == "3.3.1"
+    assert manifest.version == plugin.version == "3.4.0"
     assert manifest.api_version == 3
     assert manifest.requirements == (
         "mcp/requirements.txt",
