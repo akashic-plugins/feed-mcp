@@ -78,7 +78,7 @@ def test_feed_manage_pause_resume_and_update_preserve_history(
     result = feed_backend.feed_manage(
         action="update",
         name="OpenAI Blog",
-        url="http://rsshub:1200/openai/news",
+        url="https://openai.com/news/rss.xml",
     )
     assert "已更新" in result
 
@@ -88,7 +88,7 @@ def test_feed_manage_pause_resume_and_update_preserve_history(
             "SELECT url, enabled FROM sources WHERE id = ?", (source_id,)
         ).fetchone()
         assert source is not None
-        assert source["url"] == "http://rsshub:1200/openai/news"
+        assert source["url"] == "https://openai.com/news/rss.xml"
         assert source["enabled"] == 1
         assert connection.execute("SELECT COUNT(*) FROM items").fetchone()[0] == 1
         assert connection.execute("SELECT COUNT(*) FROM acked_items").fetchone()[0] == 1

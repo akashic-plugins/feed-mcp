@@ -55,7 +55,7 @@ Feed 把每个来源的内容统一成**事件**，去重、排序、投递都�
 
 ## 接入一个新来源的流程
 
-1. **先找 RSS**：站点自带 feed（`/feed`、`/rss`、`<link rel="alternate">`）或 RSSHub 路由（见 rsshub-route-finder skill）。有就直接 subscribe，不写脚本。
+1. **先找 RSS**：站点自带 feed（`/feed`、`/rss`、`<link rel="alternate">`）。有就直接 subscribe，不写脚本。
 2. **再找接口**：页面背后有 JSON 接口时，用 `curl … | jq` 转成事件格式，比浏览器稳定得多。
 3. **最后才用浏览器**：需要登录态或 JS 渲染时，用已登录的浏览器：
    ```sh
