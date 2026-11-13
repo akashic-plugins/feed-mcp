@@ -23,7 +23,7 @@ class FeedConfig(BaseModel):
 
 api_version = 3
 name = "feed"
-version = "3.4.0"
+version = "3.4.1"
 desc = "订阅 RSS 与脚本来源，定时抓取为格式统一的事件并投递"
 inject = (TOOLS, TIMERS)
 skill_roots = ("skills",)
