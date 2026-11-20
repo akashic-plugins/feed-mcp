@@ -57,13 +57,32 @@ Feed 把每个来源的内容统一成**事件**，去重、排序、投递都�
 
 1. **先找 RSS**：站点自带 feed（`/feed`、`/rss`、`<link rel="alternate">`）。有就直接 subscribe，不写脚本。
 2. **再找接口**：页面背后有 JSON 接口时，用 `curl … | jq` 转成事件格式，比浏览器稳定得多。
-3. **最后才用浏览器**：需要登录态或 JS 渲染时，用已登录的浏览器：
+3. **最后才用浏览器**：需要登录态或 JS 渲染时，优先走 `computer` 容器的后台 Space 接口 `http://127.0.0.1:19827/spaces/run`（在已登录主 Profile 内开后台无窗标签，不抢前台焦点、不锁用户键鼠、支持多源并发）：
    ```sh
-   opencli browser feed open "https://x.com/AnthropicAI?_fb=$(date +%s)" --window background >/dev/null
-   sleep 5
-   opencli browser feed eval '(async () => { …; return JSON.stringify({status: "ok", events}) })()' | grep '^{' | tail -n 1
+   node - <<'JS'
+   const res = await fetch("http://127.0.0.1:19827/spaces/run", {
+     method: "POST",
+     headers: { "content-type": "application/json" },
+     body: JSON.stringify({
+       space: "x-AnthropicAI",
+       url: "https://x.com/AnthropicAI?_fb=" + Math.floor(Date.now() / 1000),
+       waitFor: "article",
+       waitTimeoutMs: 12000,
+       eval: `(() => {
+         // ... 判断 login_required / blocked / stale 并返回 JSON.stringify({status: "ok", events})
+       })()`,
+     }),
+   });
+   const body = await res.json();
+   if (!body.ok) {
+     console.log(JSON.stringify({ status: "error", events: [], note: body.error || "space failed" }));
+   } else {
+     console.log(typeof body.result === "string" ? body.result : JSON.stringify(body.result));
+   }
+   JS
    ```
-   在 eval 里用 `Date.now() - performance.timeOrigin > 60000` 判断 `stale`，用登录按钮或跳转判断 `login_required`。
+   多步操作（如点敏感内容提示、翻页、fill/click）可改为传 `script` 字符串，直接用注入的 `page.goto` / `page.waitForSelector` / `page.click` / `page.evaluate`。在页面脚本里用 `Date.now() - performance.timeOrigin > 60000` 判断 `stale`，用登录按钮或跳转判断 `login_required`。
+   站点专用适配器（如 `opencli meituan` / `opencli shop`）如必须走 `opencli`，务必加 `--window background --site-session persistent --keep-tab true`；不要再用 `opencli browser ... open + sleep` 抓列表页。
 4. `feed_script(action="test", code=…)` 试跑，看报告里的 id、时间、标题是否合理；不对就改，直到 `status=ok`。
 5. `feed_script(action="save", name=…, url=…, code=…, note="这一版做了什么")`。保存会**再跑一次**，只有 `status=ok` 才保存为新版本并立即开始定时抓取（默认间隔同 RSS，可用 `interval_seconds` 调大，最少 300 秒）。
 

@@ -32,11 +32,15 @@ class FeedContentRuntime:
         *,
         now: Callable[[], datetime] | None = None,
         run_script: ScriptExecutor | None = None,
+        max_script_concurrency: int = 4,
     ) -> None:
+        if max_script_concurrency < 1:
+            raise ValueError("max_script_concurrency 必须 >= 1")
         self._data_root = data_root
         self._timers = timers
         self._watch = watch
         self._run_script = run_script
+        self._max_script_concurrency = max_script_concurrency
         self._now = now or (lambda: datetime.now(UTC))
         self._handle: TimerHandle | None = None
         self._task: asyncio.Task[None] | None = None
@@ -148,31 +152,58 @@ class FeedContentRuntime:
             )
             self._arm(deadline)
 
-    # 串行执行到期的脚本来源：共用一个已登录浏览器的脚本不会互相抢页面；
-    # 单个来源失败只记进它自己的轮询状态，不影响其他来源和本轮投递。
+    # 有界并发执行到期的脚本来源：后台 Space 互相隔离且不抢前台焦点；
+    # 写库加锁串行化，单个来源失败只记进它自己的轮询状态，不影响其他来源和本轮投递。
     async def _poll_scripts(self) -> int:
-        if self._run_script is None:
+        run_script = self._run_script
+        if run_script is None:
             return 0
         due = await asyncio.to_thread(
             scripts.due_script_sources, data_root=self._data_root, now=self._aware_now()
         )
-        for source in due:
-            # 关闭时不再开始新的脚本，卸载最多等当前这一个结束。
-            if self._closed:
-                break
-            try:
-                outcome = await self._run_script(source)
-            except Exception as error:
-                outcome = failed("error", f"{type(error).__name__}: {error}")
-            self._log.info(
-                "script source=%s v%d status=%s events=%d",
-                source.name, source.version, outcome.status, len(outcome.events),
-            )
-            await asyncio.to_thread(
-                scripts.record_outcome, data_root=self._data_root, source=source,
-                outcome=outcome, now=self._aware_now(),
-            )
-        return len(due)
+        if not due:
+            return 0
+        sem = asyncio.Semaphore(self._max_script_concurrency)
+        write_lock = asyncio.Lock()
+        polled = 0
+
+        async def run_one(source: ScriptSource) -> None:
+            nonlocal polled
+            async with sem:
+                if self._closed:
+                    return
+                try:
+                    outcome = await run_script(source)
+                except Exception as error:
+                    outcome = failed("error", f"{type(error).__name__}: {error}")
+                self._log.info(
+                    "script source=%s v%d status=%s events=%d",
+                    source.name, source.version, outcome.status, len(outcome.events),
+                )
+                try:
+                    async with write_lock:
+                        await asyncio.to_thread(
+                            scripts.record_outcome, data_root=self._data_root, source=source,
+                            outcome=outcome, now=self._aware_now(),
+                        )
+                except Exception:
+                    self._log.exception("script record_outcome failed source=%s v%d", source.name, source.version)
+                else:
+                    polled += 1
+
+        tasks = [asyncio.create_task(run_one(source)) for source in due]
+        try:
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for res in results:
+                if isinstance(res, BaseException) and not isinstance(res, asyncio.CancelledError):
+                    self._log.error("script task raised unexpected error: %r", res)
+        finally:
+            pending = [t for t in tasks if not t.done()]
+            if pending:
+                for task in pending:
+                    _ = task.cancel()
+                _ = await asyncio.gather(*pending, return_exceptions=True)
+        return polled
 
     # 把每条 Feed 条目作为一次 emit 交给值班，并在成功后立刻结算。
     async def _emit_items(self, items: tuple[dict[str, object], ...]) -> int:
