@@ -80,7 +80,7 @@ class FeedTool[A: BaseModel]:
 async def register_tools(ctx: Context, *, description: str) -> None:
     """声明 Feed 工具组并注册订阅管理与缓存查询；脚本工具由宿主执行子 Fiber 另行注册。"""
     tools = ctx.require(TOOLS)
-    await tools.declare_group(ctx, description=description)
+    await tools.declare_group(ctx, description=description, icon="rss")
     refs = [
         await _register(
             ctx, "feed_manage", ManageArgs, _manage, idempotent=False,
