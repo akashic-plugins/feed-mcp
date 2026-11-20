@@ -196,3 +196,187 @@ async def _prepare(data_root: Path, now: datetime) -> tuple[dict[str, object], .
     return await content_source._prepare_content_items(  # pyright: ignore[reportPrivateUsage]
         data_root, now
     )
+
+
+@pytest.mark.asyncio
+async def test_poll_scripts_runs_bounded_concurrently_and_isolates_failures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from feed_test_plugin.feed_runtime import scripts  # pyright: ignore[reportMissingImports]
+    from feed_test_plugin.feed_runtime.events import FeedEvent, ScriptOutcome  # pyright: ignore[reportMissingImports]
+
+    now = datetime(2026, 8, 23, 10, tzinfo=UTC)
+    monkeypatch.setattr(backend, "_now", lambda: now)
+
+    for idx in range(5):
+        scripts.save_script(
+            data_root=tmp_path,
+            name=f"src-{idx}",
+            url=f"https://example.com/{idx}",
+            code=f"echo {idx}",
+            note="init",
+            interval_seconds=300,
+            report="status=ok events=1",
+        )
+
+    active = 0
+    peak = 0
+
+    async def fake_run(source: scripts.ScriptSource) -> ScriptOutcome:
+        nonlocal active, peak
+        active += 1
+        peak = max(peak, active)
+        try:
+            await asyncio.sleep(0.08)
+            if source.name == "src-2":
+                raise RuntimeError("boom")
+            return ScriptOutcome(
+                status="ok",
+                events=(
+                    FeedEvent(
+                        id=f"ev-{source.name}",
+                        url=source.url,
+                        title=f"Title {source.name}",
+                        content="",
+                        author=None,
+                        published_at=None,
+                    ),
+                ),
+                note="ok",
+                issues=(),
+            )
+        finally:
+            active -= 1
+
+    runtime = FeedContentRuntime(
+        tmp_path,
+        _Timer(now),
+        _Watch(),
+        now=lambda: now,
+        run_script=fake_run,
+        max_script_concurrency=2,
+    )
+    polled = await runtime._poll_scripts()  # pyright: ignore[reportPrivateUsage]
+    assert polled == 5
+    assert peak == 2
+
+    with sqlite3.connect(tmp_path / "feed_mcp.sqlite3") as conn:
+        conn.row_factory = sqlite3.Row
+        states = {
+            row["name"]: row["last_status"]
+            for row in conn.execute(
+                "SELECT s.name, p.last_status FROM sources s JOIN poll_state p ON p.source_id = s.id"
+            ).fetchall()
+        }
+    assert states == {
+        "src-0": "ok",
+        "src-1": "ok",
+        "src-2": "error",
+        "src-3": "ok",
+        "src-4": "ok",
+    }
+
+
+@pytest.mark.asyncio
+async def test_poll_scripts_skips_queued_when_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from feed_test_plugin.feed_runtime import scripts  # pyright: ignore[reportMissingImports]
+    from feed_test_plugin.feed_runtime.events import ScriptOutcome  # pyright: ignore[reportMissingImports]
+
+    now = datetime(2026, 8, 23, 10, tzinfo=UTC)
+    monkeypatch.setattr(backend, "_now", lambda: now)
+
+    for idx in range(3):
+        scripts.save_script(
+            data_root=tmp_path,
+            name=f"close-{idx}",
+            url=f"https://example.com/close/{idx}",
+            code=f"echo {idx}",
+            note="init",
+            interval_seconds=300,
+            report="status=ok events=0",
+        )
+
+    started: list[str] = []
+    first_entered = asyncio.Event()
+    release_first = asyncio.Event()
+
+    async def fake_run(source: scripts.ScriptSource) -> ScriptOutcome:
+        started.append(source.name)
+        if len(started) == 1:
+            first_entered.set()
+            await release_first.wait()
+        return ScriptOutcome(status="empty", events=(), note="empty", issues=())
+
+    runtime = FeedContentRuntime(
+        tmp_path,
+        _Timer(now),
+        _Watch(),
+        now=lambda: now,
+        run_script=fake_run,
+        max_script_concurrency=1,
+    )
+    task = asyncio.create_task(runtime._poll_scripts())  # pyright: ignore[reportPrivateUsage]
+    await first_entered.wait()
+    runtime._closed = True  # pyright: ignore[reportPrivateUsage]
+    release_first.set()
+    polled = await task
+    assert polled == 1
+    assert started == ["close-0"]
+
+
+@pytest.mark.asyncio
+async def test_poll_scripts_drains_all_tasks_even_when_record_outcome_raises(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from feed_test_plugin.feed_runtime import scripts  # pyright: ignore[reportMissingImports]
+    from feed_test_plugin.feed_runtime.events import ScriptOutcome  # pyright: ignore[reportMissingImports]
+
+    now = datetime(2026, 8, 23, 10, tzinfo=UTC)
+    monkeypatch.setattr(backend, "_now", lambda: now)
+
+    for idx in range(4):
+        scripts.save_script(
+            data_root=tmp_path,
+            name=f"dberr-{idx}",
+            url=f"https://example.com/dberr/{idx}",
+            code=f"echo {idx}",
+            note="init",
+            interval_seconds=300,
+            report="status=ok events=0",
+        )
+
+    running = 0
+    orig_record = scripts.record_outcome
+
+    def flaky_record(*, data_root: Path, source: scripts.ScriptSource, outcome: ScriptOutcome, now: datetime) -> None:
+        if source.name == "dberr-0":
+            raise sqlite3.OperationalError("database is locked")
+        orig_record(data_root=data_root, source=source, outcome=outcome, now=now)
+
+    monkeypatch.setattr(scripts, "record_outcome", flaky_record)
+
+    async def fake_run(source: scripts.ScriptSource) -> ScriptOutcome:
+        nonlocal running
+        running += 1
+        try:
+            await asyncio.sleep(0.05 if source.name == "dberr-0" else 0.12)
+            return ScriptOutcome(status="empty", events=(), note="empty", issues=())
+        finally:
+            running -= 1
+
+    runtime = FeedContentRuntime(
+        tmp_path,
+        _Timer(now),
+        _Watch(),
+        now=lambda: now,
+        run_script=fake_run,
+        max_script_concurrency=4,
+    )
+    polled = await runtime._poll_scripts()  # pyright: ignore[reportPrivateUsage]
+    assert running == 0
+    assert polled == 3
