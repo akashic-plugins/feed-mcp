@@ -104,4 +104,5 @@ async def register_script_tool(ctx: Context, runner: ScriptRunner) -> ToolRef:
         description=_DESCRIPTION,
         parameters=cast(Mapping[str, object], ScriptArgs.model_json_schema()),
         open=open_tool,
+        icon="code-2",
     )
