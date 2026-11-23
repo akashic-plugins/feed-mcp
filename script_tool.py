@@ -16,9 +16,11 @@ from .feed_runtime import scripts
 from .script_runner import ScriptRunner
 
 _DESCRIPTION = (
-    "管理脚本来源：没有 RSS 的页面由一段宿主 shell 脚本抓取，最后一行输出事件 JSON。"
+    "管理脚本来源：没有 RSS 的页面由一段宿主 shell 脚本抓取，最后一行输出事件 JSON："
+    '{"status":"ok|empty|blocked|login_required|stale|error","events":[...],"note":""}；'
+    "每条事件仅允许字段 id、url、title、content、author、published_at（注意是 published_at）。"
     "test 试跑并校验格式；save 重新试跑，通过才保存为新版本并开始定时抓取；"
-    "show/history/use 查看代码、版本历史和回滚。格式与流程见 feed-manage skill。"
+    "show/history/use 查看代码、版本历史和回滚。详细流程见 feed-manage skill。"
 )
 
 

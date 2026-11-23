@@ -109,7 +109,8 @@ def _event(item: object, index: int, issues: list[str]) -> FeedEvent | None:
         return None
     value = cast(dict[str, object], item)
     before = len(issues)
-    issues.extend(f"{where} 未知字段 {key!r}" for key in value if key not in EVENT_FIELDS)
+    allowed = ", ".join(sorted(EVENT_FIELDS))
+    issues.extend(f"{where} 未知字段 {key!r}（仅允许: {allowed}）" for key in value if key not in EVENT_FIELDS)
     texts: dict[str, str] = {}
     for key in EVENT_FIELDS:
         field = value.get(key)
